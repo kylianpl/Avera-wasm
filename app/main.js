@@ -154,6 +154,16 @@ document.addEventListener("DOMContentLoaded", async function () {
 
   const worker = new Worker("worker.js", { type: "module" });
   window.__avWorker = worker; // debug beta (stats…)
+  // Slice 1 Phase 3 : render worker séparé (pixels) + canal decode→render
+  // (VideoFrames transférables + clear). Le canvas part au render worker.
+  const renderWorker = new Worker("render-worker.js", { type: "module" });
+  window.__avRenderWorker = renderWorker; // debug beta
+  const avChannel = new MessageChannel();
+  renderWorker.onmessage = (e) => {
+    if (e.data && e.data.type === "renderReady") {
+      console.log(`[render] ready, backend=${e.data.backend}`);
+    }
+  };
   let isPlaying = false;
   let mediaClockStartTime = performance.now() + performance.timeOrigin;
   let mediaClockStartSeconds = 0;
@@ -226,11 +236,13 @@ document.addEventListener("DOMContentLoaded", async function () {
     totalTime = 0;
     mediaClockStartSeconds = 0;
     mediaClockStartTime = performance.now() + performance.timeOrigin;
-    worker.postMessage({
+    // Reinit (changement de source) : le render oublie son image.
+  worker.postMessage({
       type: "reinit",
       video: event.target.value || null,
       wasm: new URLSearchParams(location.search).get("nowasm") !== "1",
     });
+  renderWorker.postMessage({ type: "clear" });
   });
 
   // Toggle video on button click
@@ -241,12 +253,14 @@ document.addEventListener("DOMContentLoaded", async function () {
         pausedVideoTime: getMediaTime(),
         videoTimeStart: performance.now() + performance.timeOrigin,
       });
+      renderWorker.postMessage({ type: "pause" });
     } else {
       worker.postMessage({
         type: "start",
         pausedVideoTime: getMediaTime(),
         videoTimeStart: performance.now() + performance.timeOrigin,
       });
+      renderWorker.postMessage({ type: "play" });
     }
   }
 
@@ -268,16 +282,25 @@ document.addEventListener("DOMContentLoaded", async function () {
     .getElementById("videoCanvas")
     .transferControlToOffscreen();
 
-  // Transfer the offscreen canvas to the worker
+  // Transfert : le canvas part au RENDER worker (pixels) ; le decode worker
+  // reçoit le port vers lui (frames transférables + clear).
   const wantWasm = new URLSearchParams(location.search).get("nowasm") !== "1";
-  worker.postMessage(
+  renderWorker.postMessage(
     {
       type: "init",
       canvas: offscreenCanvas,
+      port: avChannel.port2,
+    },
+    [offscreenCanvas, avChannel.port2],
+  );
+  worker.postMessage(
+    {
+      type: "init",
       video: document.getElementById("video").value || null,
       wasm: wantWasm,
+      renderPort: avChannel.port1,
     },
-    [offscreenCanvas],
+    [avChannel.port1],
   );
 
   // Listen for messages from the worker
@@ -496,6 +519,7 @@ document.addEventListener("DOMContentLoaded", async function () {
               pausedVideoTime: getMediaTime(),
               videoTimeStart: performance.now() + performance.timeOrigin,
             });
+            renderWorker.postMessage({ type: "pause" });
           }
         }
         uiRafId = self.requestAnimationFrame(updateUi);

@@ -1,16 +1,16 @@
 import { RingBuffer } from "./libs/ringbuf.js";
 import * as LibAVJSWebCodecs from "../packages/wc-bridge/src/bridge.js";
 import { CompatLib, LibAV } from "../packages/demux-compat/src/compat.js";
-import {
-  WebGLRenderer,
-  WebGPURenderer,
-  Canvas2DRenderer,
-} from "./video-renderer.js";
+// Note Phase 3/Slice 1 : le rendu vit dans render-worker.js (VideoFrames
+// transférables). Ici : décisions de présentation + envoi (jamais de pixels).
 
 class MediaWorker {
   constructor() {
-    this.canvas = null;
-    this.renderer = null;
+    this.canvas = null; // non utilisé (le canvas vit dans render-worker)
+    this.renderPort = null; // MessagePort vers render-worker (frames + clear)
+    this._lastSentPts = null; // pts de la tête déjà postée (pas de re-post)
+    this._renderDrawn = 0; // acks render (stats beta)
+    this.renderer = null; // non utilisé (rendu dans render-worker)
     this.isPlaying = false;
     this.isSeeking = false;
     this.fileEnded = false;
@@ -149,6 +149,7 @@ class MediaWorker {
           aQ: this.audioPacketQueue.length,
           fileEnded: this.fileEnded,
           playing: this.isPlaying,
+          renderDrawn: this._renderDrawn ?? 0,
         });
         break;
       default:
@@ -158,35 +159,19 @@ class MediaWorker {
 
   // Initialize worker with canvas and video
   async init(data) {
-    this.canvas = data.canvas;
     if (data && data.wasm !== undefined) this._wantWasm = !!data.wasm;
-    this.renderer = await this.createRenderer(this.canvas);
+    if (data && data.renderPort) {
+      this.renderPort = data.renderPort;
+      this.renderPort.onmessage = (e) => {
+        if (e.data && e.data.type === "drawn") this._renderDrawn++;
+      };
+    }
+    // (canvas ignoré : appartient à render-worker ; les renderers
+    // redimensionnent seuls par frame.)
     await this.playerInit(data.video);
   }
 
-  async createRenderer(canvas) {
-    if (typeof WebGPURenderer !== "undefined" && navigator.gpu) {
-      try {
-        const adapter = await navigator.gpu.requestAdapter();
-        if (adapter) {
-          console.log("Using WebGPU renderer");
-          return new WebGPURenderer(canvas);
-        }
-      } catch (e) {
-        console.warn("WebGPU not available, falling back to WebGL:", e);
-      }
-    }
-    if (canvas.getContext("webgl2")) {
-      console.log("Using WebGL2 renderer");
-      return new WebGLRenderer(canvas, "webgl2");
-    }
-    if (canvas.getContext("webgl")) {
-      console.log("Using WebGL renderer");
-      return new WebGLRenderer(canvas, "webgl");
-    }
-    console.log("Falling back to Canvas2D renderer");
-    return new Canvas2DRenderer(canvas);
-  }
+  // (createRenderer supprimé Slice 1 : voir render-worker.js pickRenderer.)
 
   async reInit(data) {
     this.generation++;
@@ -252,9 +237,7 @@ class MediaWorker {
           );
           if (this.videoStreamIndex == -1) {
             this.videoStreamIndex = streamInfo.index;
-            this.canvas.width = codecpar.width;
-            this.canvas.height = codecpar.height;
-        
+            // (Dimensionnement canvas : render-worker, par frame.)
           }
           this.availableStreams.video.push({
             index: streamInfo.index,
@@ -342,10 +325,8 @@ class MediaWorker {
       // Video
       if (this.videoStreamIndex != -1) {
         await this.setupVideoDecoder();
-      } else if (this.canvas) {
-        this.canvas.width = 640;
-        this.canvas.height = 360;
       }
+      // (Pas de canvas ici : render-worker dimensionne seul par frame.)
     } catch (error) {
       console.error("Error initializing media:", error);
       self.postMessage({ type: "error", message: error.message });
@@ -486,6 +467,7 @@ class MediaWorker {
   closeVideoFrames() {
     this.videoFrameBuffer.forEach((frame) => frame.close());
     this.videoFrameBuffer = [];
+    this.postRenderClear();
   }
 
   async resetDecodersForSeek() {
@@ -742,13 +724,7 @@ class MediaWorker {
       this.videoStreamIndex = streamIndex;
       await this.cleanupVideo();
       await this.setupVideoDecoder();
-      if (this.canvas) {
-        var codecpar = await this.libav.ff_copyout_codecpar(
-          this.streams[this.videoStreamIndex].codecpar,
-        );
-        this.canvas.width = codecpar.width;
-        this.canvas.height = codecpar.height;
-      }
+      // (Dimensionnement canvas : render-worker, par frame.)
     } else {
       console.warn(`Unknown stream type: ${streamType}`);
       this.isSeeking = false;
@@ -795,6 +771,7 @@ class MediaWorker {
     this.clearPacketQueues();
     this.videoFrameBuffer.forEach((frame) => frame.close());
     this.videoFrameBuffer = [];
+    this.postRenderClear();
     if (this.ringbuffer) {
       this.ringbuffer.pop(new Float32Array(this.ringbuffer.available_read()));
     }
@@ -959,6 +936,7 @@ class MediaWorker {
     this.PACKET_QUEUE_BYTES_VIDEO = 0;
     this.videoFrameBuffer.forEach((frame) => frame.close());
     this.videoFrameBuffer = [];
+    this.postRenderClear();
   }
 
   async setupVideoDecoder() {
@@ -1597,11 +1575,28 @@ class MediaWorker {
       staleFrame.close();
     }
 
-    const frame = this.videoFrameBuffer[0];
-    const result = this.renderer.draw(frame);
-    if (result && typeof result.then === 'function') {
-      result.catch(e => console.error("Renderer draw error:", e));
+    // Envoi au render worker (transfert zéro-copie) UNIQUEMENT si la tête a
+    // changé : le render ré-affiche son image en boucle via sa propre rAF
+    // (nécessaire en WebGL sans preserveDrawingBuffer). Même pixels qu'avant.
+    // Note : après transfert le handle local est neutralisé — lecture de
+    // .timestamp protégée (illisible = déjà affichée = on ne re-poste pas).
+    const head = this.videoFrameBuffer[0];
+    if (!head || !this.renderPort) return;
+    let pts = null;
+    try { pts = head.timestamp; } catch { return; }
+    if (pts === this._lastSentPts) return;
+    this._lastSentPts = pts;
+    try {
+      this.renderPort.postMessage({ type: "frame", frame: head }, [head]);
+    } catch {
+      this._lastSentPts = null;
     }
+  }
+
+  /** Signale au render worker d'oublier son image (seek/track-change). */
+  postRenderClear() {
+    this._lastSentPts = null; // la prochaine tête (même pts) doit repartir
+    try { this.renderPort?.postMessage({ type: "clear" }); } catch {}
   }
 
   async feedAudioDecoder() {
