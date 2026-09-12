@@ -7,8 +7,8 @@ import { createRequire } from "node:module";
 const require = createRequire(import.meta.url);
 const { parseCluster: wasmParseCluster, parseCues: wasmParseCues } = require("../packages/demux-wasm/nodejs/mpv_web_demux.js");
 
-const ICEAGE = "/tmp/opencode/mpv-web/media/iceage-sample.mkv";
-const FIXTURE = "/tmp/opencode/mpv-web/tests/fixtures/real-h264.mkv";
+const ICEAGE = new URL("../media/iceage-sample.mkv", import.meta.url);
+const FIXTURE = new URL("./fixtures/real-h264.mkv", import.meta.url);
 
 // Extrait les N premiers payloads Cluster complets (JS, via ebml Reader).
 async function firstClusters(path, n, scaleOut) {
@@ -54,7 +54,9 @@ async function firstClusters(path, n, scaleOut) {
 }
 
 describe("demux-wasm parity", () => {
-  it("parse_cluster ≡ JS (Ice Age, 3 clusters)", async () => {
+  it("parse_cluster ≡ JS (Ice Age, 3 clusters)", async (t) => {
+    try { await readFile(ICEAGE); }
+    catch { t.skip("sample Ice Age absent (beta local uniquement)"); return; }
     const { parseBlock } = await import("../packages/mkv-demux/src/blocks.js");
     const { Reader, ID } = await import("../packages/mkv-demux/src/ebml.js");
     const { parseClusterJs } = await import("../packages/demux-compat/src/compat.js");
@@ -82,7 +84,9 @@ describe("demux-wasm parity", () => {
     }
   });
 
-  it("parse_cues ≡ JS (Ice Age, queue de fichier)", async () => {
+  it("parse_cues ≡ JS (Ice Age, queue de fichier)", async (t) => {
+    try { await readFile(ICEAGE); }
+    catch { t.skip("sample Ice Age absent (beta local uniquement)"); return; }
     const { parseCues: parseCuesJs } = await import("../packages/mkv-demux/src/ebml.js");
     const data = await readFile(ICEAGE);
     // Cues en queue : cherche l'ID Cues dans les derniers 2Mo.

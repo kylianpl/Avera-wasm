@@ -9,7 +9,7 @@ import {
   AVMEDIA_TYPE_VIDEO, AVMEDIA_TYPE_AUDIO, AVERROR_EOF,
 } from "../packages/demux-compat/src/compat.js";
 
-const FIXTURE = new URL("../../mpv-web/tests/fixtures/real-h264.mkv", import.meta.url);
+const FIXTURE = new URL("./fixtures/real-h264.mkv", import.meta.url);
 
 // Driver minimal côté "worker" : répond onblockread par lectures fs.
 async function openFile(path) {

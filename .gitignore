@@ -1,0 +1,12 @@
+node_modules/
+*.log
+# Médias beta locaux (gros binaires, non versionnés ; voir media/ README)
+/media/*.mkv
+/media/*.mp4
+!/media/.gitkeep
+# Certs TLS locaux (générés, cf. mpv-web server/gencerts.sh)
+/server/certs/*
+!/server/certs/.gitkeep
+# Builds WASM (reproductibles : wasm-pack build crates/mkv-demux)
+/packages/demux-wasm/web/
+/packages/demux-wasm/nodejs/
