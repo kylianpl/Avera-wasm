@@ -1,0 +1,175 @@
+<!doctype html>
+<meta charset="utf-8">
+<link rel="icon" href="data:,">
+<title>repro Firefox bug 2054811 (VA-API readback squish)</title>
+<style>body{background:#111;color:#ddd;font-family:monospace;max-width:1000px;margin:16px}canvas{border:1px solid #555;max-width:480px}.zoom{image-rendering:pixelated}.row{display:flex;gap:12px}button{font-size:16px;padding:6px 14px}</style>
+<h1>repro bug 2054811 — VA-API readback servie avec padding</h1>
+<p>Décode <code>pad-green.mp4</code> (1920x1080 codé 1920x1088, 8 lignes vertes en padding)
+  via WebCodecs <b>prefer-hardware</b>, affiche via <b>WebGL texImage2D</b> (gauche)
+  contre le même flux en <b>prefer-software + 2d</b> (droite, référence saine).
+  Bug présent si : bande verte en bas à gauche + image tassée.</p>
+<p>Référence : <a href="https://bugzilla.mozilla.org/show_bug.cgi?id=2054811">bug 2054811</a>
+  (fix : branche 157). Testé KO sur Floorp/Firefox ≤156 avec VA-API.</p>
+<button id="run">Lancer</button>
+<pre id="out">en attente…</pre>
+<div class="row">
+  <div><div>HW + WebGL (suspect)</div><canvas id="hw" width="480" height="270"></canvas><br>
+    <canvas id="hwz" class="zoom" width="480" height="80"></canvas> <span>bandeau bas ×8</span></div>
+  <div><div>SW + 2d (référence)</div><canvas id="sw" width="480" height="270"></canvas><br>
+    <canvas id="swz" class="zoom" width="480" height="80"></canvas> <span>bandeau bas ×8</span></div>
+</div>
+<script type="module">
+const out = (t) => { document.getElementById("out").textContent += t + "\n"; };
+
+// ---- Mini-démux MP4 (1 piste vidéo avcC, pas de B-reorder requis : visuel seul) ----
+function boxes(buf, start, end) {
+  const out = [];
+  let p = start;
+  const dv = new DataView(buf.buffer, buf.byteOffset);
+  while (p + 8 <= end) {
+    let size = dv.getUint32(p);
+    const type = String.fromCharCode(buf[p+4], buf[p+5], buf[p+6], buf[p+7]);
+    let hlen = 8;
+    if (size === 1) { size = Number(dv.getBigUint64(p + 8)); hlen = 16; }
+    if (size === 0) size = end - p;
+    out.push({ type, start: p, head: p + hlen, end: Math.min(end, p + size) });
+    if (size <= 0) break;
+    p += size;
+  }
+  return out;
+}
+const find = (buf, s, e, t) => boxes(buf, s, e).filter((b) => b.type === t);
+async function demux(url) {
+  const buf = new Uint8Array(await (await fetch(url)).arrayBuffer());
+  const moov = find(buf, 0, buf.length, "moov")[0];
+  const trak = find(buf, moov.head, moov.end, "trak").find((t) => {
+    const mdia = find(buf, t.head, t.end, "mdia")[0];
+    const hdlr = find(buf, mdia.head, mdia.end, "hdlr")[0];
+    return String.fromCharCode(buf[hdlr.head+8], buf[hdlr.head+9], buf[hdlr.head+10], buf[hdlr.head+11]) === "vide";
+  });
+  const mdia = find(buf, trak.head, trak.end, "mdia")[0];
+  const minf = find(buf, mdia.head, mdia.end, "minf")[0];
+  const stbl = find(buf, minf.head, minf.end, "stbl")[0];
+  const stsd = find(buf, stbl.head, stbl.end, "stsd")[0];
+  const avc1 = find(buf, stsd.head + 8, stsd.end, "avc1")[0];
+  const avcC = find(buf, avc1.head + 78, avc1.end, "avcC")[0];
+  const extradata = buf.slice(avcC.head, avcC.end);
+  const stsz = find(buf, stbl.head, stbl.end, "stsz")[0];
+  const stsc = find(buf, stbl.head, stbl.end, "stsc")[0];
+  const stco = find(buf, stbl.head, stbl.end, "stco")[0] ?? find(buf, stbl.head, stbl.end, "co64")[0];
+  const dv = new DataView(buf.buffer, buf.byteOffset);
+  const sampleCount = dv.getUint32(stsz.head + 8);
+  const sampleSize = dv.getUint32(stsz.head + 4);
+  let sizes = [];
+  if (sampleSize !== 0) sizes = new Array(sampleCount).fill(sampleSize);
+  else for (let i = 0; i < sampleCount; i++) sizes.push(dv.getUint32(stsz.head + 12 + i * 4));
+  const nsc = dv.getUint32(stsc.head + 4);
+  const runs = [];
+  for (let i = 0; i < nsc; i++) runs.push([dv.getUint32(stsc.head + 8 + i * 12), dv.getUint32(stsc.head + 12 + i * 12)]);
+  const nch = stco.type === "co64" ? Number((dv.getBigUint64(stco.head + 4))) : dv.getUint32(stco.head + 4);
+  const chunks = [];
+  for (let i = 0; i < nch; i++) chunks.push(stco.type === "co64" ? Number(dv.getBigUint64(stco.head + 8 + i * 8)) : dv.getUint32(stco.head + 8 + i * 4));
+  // Échantillons (ordre chunks = ordre decode pour ce sample).
+  const samples = [];
+  let si = 0, ri = 0, perChunk = runs[0][1], inChunk = 0, off = chunks[0];
+  while (si < sizes.length) {
+    while (ri + 1 < runs.length && si + 1 >= runs[ri + 1][0]) { ri++; perChunk = runs[ri][1]; }
+    if (inChunk >= perChunk) { inChunk = 0; off = chunks[chunks.indexOf(off) + 1]; }
+    const len = sizes[si++];
+    samples.push(buf.slice(off, off + len));
+    off += len; inChunk++;
+  }
+  const codec = "avc1." + [extradata[1], extradata[2], extradata[3]].map((b) => b.toString(16).padStart(2, "0")).join("");
+  return { samples, extradata, codec };
+}
+
+function glSetup(canvas) {
+  const gl = canvas.getContext("webgl2") ?? canvas.getContext("webgl");
+  const sh = (t, s) => { const o = gl.createShader(t); gl.shaderSource(o, s); gl.compileShader(o); return o; };
+  const pr = gl.createProgram();
+  gl.attachShader(pr, sh(gl.VERTEX_SHADER, "attribute vec2 xy;varying highp vec2 uv;void main(void){gl_Position=vec4(xy,0.,1.);uv=vec2((1.+xy.x)/2.,(1.-xy.y)/2.);}"));
+  gl.attachShader(pr, sh(gl.FRAGMENT_SHADER, "precision mediump float;varying highp vec2 uv;uniform sampler2D texture;void main(){gl_FragColor=texture2D(texture,uv);}"));
+  gl.linkProgram(pr); gl.useProgram(pr);
+  gl.bindBuffer(gl.ARRAY_BUFFER, gl.createBuffer());
+  gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1, -1, -1, 1, 1, 1, 1, -1]), gl.STATIC_DRAW);
+  const loc = gl.getAttribLocation(pr, "xy");
+  gl.enableVertexAttribArray(loc);
+  gl.vertexAttribPointer(loc, 2, gl.FLOAT, false, 0, 0);
+  const tex = gl.createTexture();
+  gl.bindTexture(gl.TEXTURE_2D, tex);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+  return { gl, tex };
+}
+
+document.getElementById("run").onclick = async () => {
+  document.getElementById("out").textContent = "";
+  try {
+    const { samples, extradata, codec } = await demux("pad-green.mp4");
+    out(`échantillons: ${samples.length}, codec=${codec}, extradata=${extradata.length}o`);
+    const mkDec = async (hw) => {
+      const cfg = { codec, codedWidth: 1920, codedHeight: 1080, description: extradata, hardwareAcceleration: hw };
+      const sup = await VideoDecoder.isConfigSupported(cfg).catch(() => ({ supported: false }));
+      out(`${hw}: support=${sup.supported}`);
+      return sup.supported;
+    };
+    // HW + WebGL
+    const hwc = document.getElementById("hw"), hwz = document.getElementById("hwz");
+    const hx = hwz.getContext("2d");
+    const { gl, tex } = glSetup(hwc);
+    const supHW = await mkDec("prefer-hardware");
+    let greenRows = 0, nHW = 0;
+    if (supHW) {
+      const frames = [];
+      const dec2 = new VideoDecoder({
+        output: (f) => { frames.push(f); },
+        error: (e) => out("HW err: " + e.message),
+      });
+      dec2.configure({ codec, codedWidth: 1920, codedHeight: 1080, description: extradata, hardwareAcceleration: "prefer-hardware" });
+      samples.forEach((s, i) => dec2.decode(new EncodedVideoChunk({ type: i === 0 ? "key" : "delta", timestamp: i * 66667, data: s })));
+      await dec2.flush().catch(() => {});
+      nHW = frames.length;
+      out(`HW: ${nHW} frames décodées`);
+      for (const f of frames) {
+        gl.bindTexture(gl.TEXTURE_2D, tex);
+        gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, f);
+        gl.viewport(0, 0, 480, 270);
+        gl.drawArrays(gl.TRIANGLE_FAN, 0, 4);
+        f.close();
+      }
+      // Bandeau bas ×8 + comptage vert (readback synchrone, même tâche).
+      hx.clearRect(0, 0, 480, 80);
+      hx.drawImage(hwc, 0, 270 - 34, 480, 34, 0, 0, 480, 80);
+      const px = new Uint8Array(480 * 270 * 4);
+      gl.readPixels(0, 0, 480, 270, gl.RGBA, gl.UNSIGNED_BYTE, px);
+      for (let y = 262; y < 270; y++)
+        for (let x = 0; x < 480; x += 7) {
+          const o = (y * 480 + x) * 4;
+          if (px[o + 1] > 100 && px[o + 1] > px[o] + 40 && px[o + 1] > px[o + 2] + 40) { greenRows++; break; }
+        }
+      out(`HW: lignes vertes en bas (0 attendu si sain) = ${greenRows}/8`);
+    }
+    // SW + 2d (référence)
+    const swc = document.getElementById("sw"), swz = document.getElementById("swz");
+    const sx = swc.getContext("2d"), sxz = swz.getContext("2d");
+    const supSW = await mkDec("prefer-software");
+    if (supSW) {
+      const frames = [];
+      const d2 = new VideoDecoder({ output: (f) => { frames.push(f); }, error: (e) => out("SW err: " + e.message) });
+      d2.configure({ codec, codedWidth: 1920, codedHeight: 1080, description: extradata, hardwareAcceleration: "prefer-software" });
+      samples.forEach((s, i) => d2.decode(new EncodedVideoChunk({ type: i === 0 ? "key" : "delta", timestamp: i * 66667, data: s })));
+      await d2.flush().catch(() => {});
+      out(`SW: ${frames.length} frames décodées`);
+      const last = frames[frames.length - 1];
+      if (last) { sx.drawImage(last, 0, 0, 480, 270); sxz.drawImage(swc, 0, 270 - 34, 480, 34, 0, 0, 480, 80); }
+      frames.forEach((f) => { try { f.close(); } catch {} });
+    }
+    out(greenRows > 0 ? "❌ BUG REPRODUIT (bande verte côté HW)" : "✅ pas de bande verte (fixé ou pas de HW)");
+    window.__repro = { nHW, greenRows };
+  } catch (e) {
+    out("ERREUR: " + (e?.message ?? e));
+  }
+};
+</script>
