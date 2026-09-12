@@ -67,12 +67,14 @@ function tsUs(pts, num, den) {
 
 /** EncodedVideoChunk depuis un paquet démuxé.
  *  pkt = { key:bool, pts:number(ticks), duration:number(ticks),
- *          timeBaseNum, timeBaseDen, data:Uint8Array (layout démuxeur-verbatim) }.
+ *          time_base_num/time_base_den (noms FFmpeg, comme libav),
+ *          data:Uint8Array (layout démuxeur-verbatim) }.
  *  Règles bridge : type=flags&1 (ici key), duration TOUJOURS posée (souvent 0),
  *  data verbatim. DÉVIATION : copie au lieu d'alias .buffer (le bridge ignore
  *  byteOffset — bug latent ; la copie est sûre et équivalente au décodage). */
 export function packetToEncodedVideoChunk(pkt) {
-  const num = pkt.timeBaseNum || 1, den = pkt.timeBaseDen || 1000000;
+  const num = pkt.time_base_num ?? pkt.timeBaseNum ?? 1;
+  const den = pkt.time_base_den ?? pkt.timeBaseDen ?? 1000000;
   return {
     type: pkt.key ? "key" : "delta",
     timestamp: tsUs(pkt.pts, num, den),
@@ -112,7 +114,8 @@ export function audioStreamToConfig(t) {
 }
 
 /** EncodedAudioChunk : type toujours 'key', duration toujours posée, verbatim. */export function packetToEncodedAudioChunk(pkt) {
-  const num = pkt.timeBaseNum || 1, den = pkt.timeBaseDen || 1000000;
+  const num = pkt.time_base_num ?? pkt.timeBaseNum ?? 1;
+  const den = pkt.time_base_den ?? pkt.timeBaseDen ?? 1000000;
   return {
     type: "key",
     timestamp: tsUs(pkt.pts, num, den),

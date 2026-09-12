@@ -153,6 +153,7 @@ document.addEventListener("DOMContentLoaded", async function () {
   ///////////////////////////
 
   const worker = new Worker("worker.js", { type: "module" });
+  window.__avWorker = worker; // debug beta (stats…)
   let isPlaying = false;
   let mediaClockStartTime = performance.now() + performance.timeOrigin;
   let mediaClockStartSeconds = 0;
@@ -277,7 +278,10 @@ document.addEventListener("DOMContentLoaded", async function () {
 
   // Listen for messages from the worker
   worker.onmessage = async function (e) {
-    if (e.data.type === "videoStatus") {
+    if (e.data.type === "statsReport") {
+      window.__avStats = e.data;
+      console.log("[av-stats]", JSON.stringify(e.data));
+    } else if (e.data.type === "videoStatus") {
       // Update animation state
       isPlaying = e.data.isPlaying;
       mediaClockStartSeconds = getMediaTime();

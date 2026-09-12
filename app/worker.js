@@ -126,6 +126,26 @@ class MediaWorker {
       case "changeStream":
         await this.changeStream(e.data.streamType, e.data.index);
         break;
+      case "stats":
+        // Debug beta : compteurs instantanés (inaudible en prod).
+        self.postMessage({
+          type: "statsReport",
+          vFed: this._vFed ?? 0,
+          vOut: this._vOut ?? 0,
+          vQ: this.videoPacketQueue.length,
+          vQBytes: this.PACKET_QUEUE_BYTES_VIDEO,
+          vBuf: this.videoFrameBuffer.length,
+          vBuf0Ts: this.videoFrameBuffer.length ? this.videoFrameBuffer[0].timestamp : null,
+          vClockMs: (() => { try { return Math.round(this.currentVideoTime()); } catch { return null; } })(),
+          decQ: (() => { try { return this.WCVideoDecoder?.decodeQueueSize ?? null; } catch { return null; } })(),
+          decState: this.WCVideoDecoder?.state ?? null,
+          aFed: this._aFed ?? 0,
+          aOut: this._aOut ?? 0,
+          aQ: this.audioPacketQueue.length,
+          fileEnded: this.fileEnded,
+          playing: this.isPlaying,
+        });
+        break;
       default:
         console.warn("Unknown message type:", e.data.type);
     }
@@ -1480,6 +1500,7 @@ class MediaWorker {
             packet,
             this.streams[this.videoStreamIndex],
           );
+          this._vFed = (this._vFed ?? 0) + 1;
           this.WCVideoDecoder.decode(new EncodedVideoChunk(chunk));
         } else {
           const frames = await this.libav.ff_decode_multi(
@@ -1506,6 +1527,7 @@ class MediaWorker {
       console.warn(
         "bufferVideoFrame called while seeking (output of video decoder)",
       );
+    this._vOut = (this._vOut ?? 0) + 1;
     this.videoFrameBuffer.push(frame);
     this.schedulePipelinePump();
   }
@@ -1629,6 +1651,7 @@ class MediaWorker {
             this.streams[this.audioStreamIndex],
           );
           if (!this.WCAudioDecoder) return;
+          this._aFed = (this._aFed ?? 0) + 1;
           this.WCAudioDecoder.decode(new EncodedAudioChunk(chunk));
         } else {
           if (!this.AudioDecoderCodecContext) return;
@@ -1697,6 +1720,7 @@ class MediaWorker {
     // Audio step 3/3: buffer decoded audio data into the ring buffer
     // this gets called from the audio decoder output callback (when a frame is decoded)
     // the ring buffer is then read by the AudioWorkletProcessor
+    this._aOut = (this._aOut ?? 0) + 1;
 
     // based on https://github.com/w3c/webcodecs/blob/724b7d620519450c0c9630ab4eb97fe555f9007b/samples/lib/audio_renderer.js#L168
     if (this.isSeeking)
