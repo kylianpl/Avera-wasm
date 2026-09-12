@@ -106,6 +106,16 @@ export class CompatLib {
   }
   // Espace de noms statique (remplace `LibAV.AVMEDIA_TYPE_*` du worker).
   // (voir export LibAV plus bas)
+  async init({ wasm = true } = {}) {
+    if (wasm) {
+      try {
+        this.wasmReady = await enableWasm();
+      } catch {
+        this.wasmReady = false;
+      }
+    }
+    return !!this.wasmReady;
+  }
   // -- D1 : FS virtuel --
   async mkblockreaderdev(name, size) {
     this.vfs.set(name, { size: BigInt(size), blocks: new Map() });
@@ -314,9 +324,51 @@ _m.avcodec_flush_buffers = function () { return avcodec_flush_buffers(); };
 // ---- D6 : curseur paquet (opaque, compat gère son curseur) ----
 export async function av_packet_alloc() { return {}; }
 
+// ---- Backend WASM optionnel (Phase 1B) : même parsing, en Rust.
+// Chargé à la demande (défaut ON quand dispo, ?nowasm=1 pour forcer JS).
+// Parité byte-exact prouvée (tests/demux-wasm-parity).
+let wasmMod = null;
+export async function enableWasm() {
+  if (wasmMod) return true;
+  try {
+    const m = await import("../../demux-wasm/web/mpv_web_demux.js");
+    await m.default();
+    wasmMod = m;
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/** Parse un payload Cluster (JS) → [{block, payload, durTicks}] (tests/parité). */
+export function parseClusterJs(buf, timecodeScale) {
+  return parseClusterPayload({ timecodeScale }, buf, 0n).blocks;
+}
+
 // ---- Lecture clusters → paquets ----
 function parseClusterPayload(session, buf, baseOff) {
   // buf = payload Cluster complet ; baseOff = offset absolu du payload.
+  // Backend WASM si armé (parité prouvée) : normalisé vers la forme JS.
+  if (wasmMod) {
+    try {
+      const arr = wasmMod.parseCluster(buf, Number(session.timecodeScale));
+      return {
+        clusterTicks: null,
+        blocks: arr.map((p) => ({
+          block: {
+            track: BigInt(Math.trunc(p.track)),
+            ptsNs: BigInt(Math.trunc(p.ptsNs)),
+            key: !!p.key,
+            frames: p.frames.map((f) => ({ off: f.off | 0, len: f.len | 0 })),
+          },
+          payload: p.data instanceof Uint8Array ? p.data : new Uint8Array(p.data),
+          durTicks: BigInt(Math.trunc(Number(p.durNs) / Number(session.timecodeScale))),
+        })),
+      };
+    } catch {
+      // Repli JS silencieux (robustesse beta).
+    }
+  }
   const out = [];
   const cr = new Reader(buf);
   let clusterTicks = null;
@@ -384,7 +436,18 @@ async function ensureCues(session) {
       catch { break; }
       const end = e.size === null ? buf.length : Math.min(buf.length, r.p + Number(e.size));
       if (e.id === ID.Cues) {
-        session.cues = parseCues(buf.subarray(r.p, end), session.timecodeScale);
+        const payload = buf.subarray(r.p, end);
+        if (wasmMod) {
+          try {
+            session.cues = wasmMod.parseCues(payload, Number(session.timecodeScale)).map((c) => ({
+              timeNs: BigInt(Math.trunc(c.timeNs)),
+              track: BigInt(Math.trunc(c.track)),
+              clusterPos: BigInt(Math.trunc(c.clusterPos)),
+            }));
+            break;
+          } catch {}
+        }
+        session.cues = parseCues(payload, session.timecodeScale);
         break;
       }
       r.p = end <= s0 ? s0 + 1 : end;

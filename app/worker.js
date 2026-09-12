@@ -96,7 +96,12 @@ class MediaWorker {
     if (!this.libav) {
       // Compat sans libav (démux maison, voir packages/demux-compat).
       this.libav = new CompatLib();
-      console.log(`[worker] demux backend: ${this.libav.libavjsMode}`);
+      try {
+        const ok = await this.libav.init({ wasm: this._wantWasm ?? true });
+        console.log(`[worker] demux backend: demux-compat (sans libav) + ${ok ? "parse WASM" : "parse JS"}`);
+      } catch {
+        console.log(`[worker] demux backend: demux-compat (sans libav) + parse JS`);
+      }
     }
   }
 
@@ -154,6 +159,7 @@ class MediaWorker {
   // Initialize worker with canvas and video
   async init(data) {
     this.canvas = data.canvas;
+    if (data && data.wasm !== undefined) this._wantWasm = !!data.wasm;
     this.renderer = await this.createRenderer(this.canvas);
     await this.playerInit(data.video);
   }
@@ -185,6 +191,10 @@ class MediaWorker {
   async reInit(data) {
     this.generation++;
     this.seekSerial++;
+    if (data && data.wasm !== undefined && !!data.wasm !== !!this._wantWasm) {
+      this._wantWasm = !!data.wasm;
+      this.libav = null; // force la réinit (change de backend parse)
+    }
     this.cancelRenderLoop();
     this.isPlaying = false;
     self.postMessage({ type: "videoStatus", isPlaying: false });

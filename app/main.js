@@ -172,6 +172,7 @@ document.addEventListener("DOMContentLoaded", async function () {
       o.textContent = src.split("/").pop() || src;
       sel.appendChild(o);
       sel.value = src;
+      sel.dispatchEvent(new Event("change", { bubbles: true }));
     }
   } catch {}
 
@@ -228,6 +229,7 @@ document.addEventListener("DOMContentLoaded", async function () {
     worker.postMessage({
       type: "reinit",
       video: event.target.value || null,
+      wasm: new URLSearchParams(location.search).get("nowasm") !== "1",
     });
   });
 
@@ -267,11 +269,13 @@ document.addEventListener("DOMContentLoaded", async function () {
     .transferControlToOffscreen();
 
   // Transfer the offscreen canvas to the worker
+  const wantWasm = new URLSearchParams(location.search).get("nowasm") !== "1";
   worker.postMessage(
     {
       type: "init",
       canvas: offscreenCanvas,
       video: document.getElementById("video").value || null,
+      wasm: wantWasm,
     },
     [offscreenCanvas],
   );

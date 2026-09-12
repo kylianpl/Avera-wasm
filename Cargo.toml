@@ -1,0 +1,3 @@
+[workspace]
+members = ["crates/mkv-demux"]
+resolver = "2"
