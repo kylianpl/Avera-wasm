@@ -80,4 +80,14 @@ describe("demux-compat", () => {
     // Recalé sur keyframe ≤ cible (tolérance large : fixture 2s).
     assert.ok(pkts[0].pts <= 1000000000);
   });
+
+  it("seek accepte les ts float (worker calcule en float)", async () => {
+    const { session, streams } = await openFile(FIXTURE);
+    const vIdx = streams.find((s) => s.codec_type === AVMEDIA_TYPE_VIDEO).index;
+    // Regression beta : BigInt(3960416617.82066) jetait et tuait le changeStream.
+    const r = await av_seek_frame(session, vIdx, 3960416617.82066, 0, 0);
+    assert.equal(r, 0);
+    const [, dict] = await ff_read_frame_multi(session, {}, { limit: 262144 });
+    assert.ok(Object.keys(dict).length > 0);
+  });
 });

@@ -304,6 +304,9 @@ document.addEventListener("DOMContentLoaded", async function () {
         e.data.sampleRate,
         e.data.sharedArrayBuffer,
       );
+      // Changement de piste en cours de lecture : le nouveau nœud doit être
+      // branché/démarré (le chemin normal passe par videoStatus, absent ici).
+      if (isPlaying) await startAudio();
     } else if (e.data.type === "initFinished") {
       document.getElementById("buffering").style.display = "none";
       document.getElementById("playStopButton").disabled = false;

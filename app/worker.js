@@ -707,18 +707,25 @@ class MediaWorker {
     this.isSeeking = true;
     this.cancelRenderLoop();
 
-    // Flush the other decoder before seeking so no stale frames leak in
+    // Reset (pas flush) l'autre décodeur : un flush pend pour toujours sur un
+    // décodeur coincé, et la position saute de toute façon (seek derrière) donc
+    // les frames en vol sont périmées. Miroir de resetDecodersForSeek.
     if (streamType === "audio" && this.WCVideoDecoder) {
-      await this.WCVideoDecoder.flush();
+      try {
+        if (this.WCVideoDecoder.state == "configured") {
+          this.WCVideoDecoder.reset();
+          if (this.videoConfig) this.WCVideoDecoder.configure(this.videoConfig);
+        }
+      } catch (e) { console.warn("video reset on audio switch:", e); }
     } else if (streamType === "video") {
-      if (this.WCAudioDecoder) {
-        if (this.WCAudioDecoder.state == "configured")
-          await this.WCAudioDecoder.flush();
-      } else if (this.AudioDecoderCodecContext) {
-        await this.libav.avcodec_flush_buffers(
-          this.AudioDecoderCodecContext,
-        );
-      }
+      try {
+        if (this.WCAudioDecoder && this.WCAudioDecoder.state == "configured") {
+          this.WCAudioDecoder.reset();
+          if (this.audioConfig) this.WCAudioDecoder.configure(this.audioConfig);
+        } else if (this.AudioDecoderCodecContext) {
+          await this.libav.avcodec_flush_buffers(this.AudioDecoderCodecContext);
+        }
+      } catch (e) { console.warn("audio reset on video switch:", e); }
       if (this.feedAudioDecoderTimeout) {
         clearTimeout(this.feedAudioDecoderTimeout);
         this.feedAudioDecoderTimeout = null;

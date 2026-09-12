@@ -562,10 +562,17 @@ function routeBlocks(session, blocks, byIdx) {
 
 // ---- D8 : seek (temps s, ns internes) ----
 export async function av_seek_frame(session, streamIdx, ts, _a, _flags) {
-  return seekNs(session, BigInt(ts));
+  return seekNs(session, coerceTs(ts));
 }
 export async function avformat_seek_file_max(session, streamIdx, ts, _a, _flags) {
-  return seekNs(session, BigInt(ts));
+  return seekNs(session, coerceTs(ts));
+}
+// Le worker calcule ts en float (currentTime * den/num) : BigInt() direct
+// jetterait sur les non-entiers et tuerait le changeStream (vu en beta).
+function coerceTs(ts) {
+  const n = Number(ts);
+  if (!Number.isFinite(n) || n < 0) return 0n;
+  return BigInt(Math.floor(n));
 }
 async function seekNs(session, targetNs) {
   try {
