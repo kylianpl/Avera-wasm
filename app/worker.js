@@ -252,6 +252,10 @@ class MediaWorker {
           renderDrawn: this._renderDrawn ?? 0,
           posted: this._posted ?? 0,
           staleDropped: this._staleDropped ?? 0,
+          demuxPos: this._demuxPos ?? null,
+          ringSecs: (() => { try {
+            return this.ringbuffer ? (this.ringbuffer.capacity() - this.ringbuffer.available_write()) / (this.channelCount * this.audioSampleRate) : null;
+          } catch { return null; } })(),
         });
         break;
       default:
@@ -1459,13 +1463,9 @@ class MediaWorker {
       this.packet = await this.libav.av_packet_alloc();
     }
     if (!this.formatContext) return;
-    // Remplit par RPC (quotas calés sur needsMorePackets) : le demux lit des
-    // clusters, on enfile localement. Génération : ignore les réponses périmées.
-    const vNeed = this.videoStreamIndex === -1 ? 0
-      : Math.max(0, Math.min(64, this.PACKET_QUEUE_MIN_SIZE - this.videoPacketQueue.length));
-    const aNeed = this.audioStreamIndex === -1 ? 0
-      : Math.max(0, Math.min(64, this.PACKET_QUEUE_MIN_SIZE - this.audioPacketQueue.length));
-    if (!vNeed && !aNeed) return true;
+    // Remplit par RPC : le demux retourne tout ce qu'il parse (borné ~2Mo/RPC),
+    // on enfile (les seuils needsMorePackets bornent le staging côté decode).
+    // Génération : ignore les réponses périmées.
     const gen = this.demuxGen ?? 0;
     let r;
     try {
@@ -1473,14 +1473,13 @@ class MediaWorker {
         gen,
         videoIdx: this.videoStreamIndex,
         audioIdx: this.audioStreamIndex,
-        videoN: vNeed,
-        audioN: aNeed,
       });
     } catch (e) {
       console.error("Error reading frame:", e?.message ?? e);
       return false;
     }
     if (r.gen !== gen) return true; // périmé (seek entre-temps) : on ignore, on continue
+    if (r.pos != null) this._demuxPos = r.pos; // debug beta (traçage EOF fantôme)
     if (r.eof) {
       this.fileEnded = true;
       return (r.video?.length ?? 0) + (r.audio?.length ?? 0) > 0;

@@ -124,34 +124,26 @@ async function handleRpc(d) {
         break;
       }
       case "read": {
-        // Remplit jusqu'aux quotas (borné) : {video[], audio[], eof}.
+        // Remplit SANS quotas par type : tout ce qui est parsé est retourné.
+        // (Les quotas tronquaient : readPos avançait quand même → contenu perdu
+        // = sauts périodiques audio/vidéo en beta.) Le staging côté decode
+        // (60 paquets/16Mo) borne déjà l'avance ; ici on borne le travail/RPC.
         if (!session) throw new Error("not open");
         const vIdx = d.videoIdx, aIdx = d.audioIdx;
-        const wantV = Math.min(d.videoN ?? 0, 64), wantA = Math.min(d.audioN ?? 0, 64);
         const video = [], audio = [];
-        let eof = false, guard = 0;
-        while ((video.length < wantV || audio.length < wantA) && guard++ < 12) {
+        let bytes = 0, eof = false, guard = 0;
+        const take = (arr, out) => {
+          for (const p of arr) { out.push(p); bytes += p.size ?? 0; }
+        };
+        while (guard++ < 12 && bytes < 2 * 1048576) {
           const [res, dict] = await ff_read_frame_multi(session, {}, { limit: 524288 });
           if (res === AVERROR_EOF) { eof = true; break; }
           if (res < 0) throw new Error(`demux read ${res}`);
-          if (vIdx !== -1 && vIdx !== null && video.length < wantV) {
-            for (const p of dict[vIdx] ?? []) {
-              if (video.length >= wantV) break;
-              video.push(p);
-            }
-          }
-          if (aIdx !== -1 && aIdx !== null && audio.length < wantA) {
-            for (const p of dict[aIdx] ?? []) {
-              if (audio.length >= wantA) break;
-              audio.push(p);
-            }
-          }
-          if (!Object.keys(dict).length) {
-            if (session.eof) { eof = true; break; }
-            break; // fenêtre sans paquets : rend la main (prochain appel continue)
-          }
+          if (vIdx !== -1 && vIdx !== null) take(dict[vIdx] ?? [], video);
+          if (aIdx !== -1 && aIdx !== null) take(dict[aIdx] ?? [], audio);
+          if (!Object.keys(dict).length) break; // fenêtre sans paquets : rend la main
         }
-        reply(true, { gen: d.gen, video, audio, eof }, [...collectTransfer(video), ...collectTransfer(audio)]);
+        reply(true, { gen: d.gen, video, audio, eof, pos: session ? String(session.readPos) : null }, [...collectTransfer(video), ...collectTransfer(audio)]);
         break;
       }
       case "seek": {
