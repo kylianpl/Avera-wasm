@@ -1401,8 +1401,10 @@ class MediaWorker {
   }
 
   needsMorePackets(type) {
-    // Seuils d'origine (60 paquets / 16Mo) : le staging absorbe l'avance
-    // démux, la présentation (dû/périmé) trie. Pas de gate fraîcheur ici.
+    // Seuils d'origine uniquement (60 paquets / 16Mo). Tenté : plafonner
+    // l'avance au présent (pacing x1) — mais tout gate côté production affame
+    // ce décodeur (qui veut un flux soutenu, pas du goutte-à-goutte) et fige
+    // tout. La fraîcheur reste gérée à la présentation (dû/périmé).
     if (type === "video") {
       return this.videoStreamIndex !== -1 &&
         this.videoPacketQueue.length < this.PACKET_QUEUE_MIN_SIZE &&
