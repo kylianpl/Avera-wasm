@@ -483,14 +483,29 @@ export async function ff_read_frame_multi(session, _packet, opts = {}) {
     const r = new Reader(win);
     while (!r.eof) {
       const s0 = r.p;
-      let e;
-      try { e = r.elem(); }
-      catch { break; } // header tronqué : on avance de ce qui est consommé (ci-dessous)
-      const end = e.size === null ? null : r.p + Number(e.size);
-      if (e.id === ID.Cluster && (end === null || winStart + BigInt(end) > winStart + BigInt(win.length))) {
-        if (end !== null) {
+      const abs0 = winStart + BigInt(s0);
+      let e = null, hlen = 0;
+      try {
+        e = r.elem();
+        hlen = r.p - s0;
+      } catch {
+        // Header à cheval sur la fin de fenêtre : complète (ID ≤4 + taille ≤8).
+        try {
+          const hb = await lib.read(name, abs0, 12);
+          const hr = new Reader(hb);
+          e = hr.elem();
+          hlen = hr.p;
+        } catch {
+          break; // illisible : avance d'un cran (ci-dessous)
+        }
+      }
+      if (!e) break;
+      // Fin absolue de l'élément (null = taille inconnue).
+      const elemEnd = e.size === null ? null : abs0 + BigInt(hlen) + e.size;
+      if (e.id === ID.Cluster && (elemEnd === null || elemEnd > winStart + BigInt(win.length))) {
+        if (elemEnd !== null) {
           // À cheval : complète (borné par la taille annoncée).
-          const need = Number(winStart + BigInt(end) - (winStart + BigInt(win.length)));
+          const need = Number(elemEnd - (winStart + BigInt(win.length)));
           if (need > 64 * 1048576) break; // garde-fou cluster absurde
           try {
             const tail = await lib.read(name, winStart + BigInt(win.length), need);
@@ -498,17 +513,17 @@ export async function ff_read_frame_multi(session, _packet, opts = {}) {
             const full = new Uint8Array(win.length - s0 + tail.length);
             full.set(win.subarray(s0));
             full.set(tail, win.length - s0);
-            const { blocks } = parseClusterPayload(session, full.subarray(r.p - s0), winStart + BigInt(r.p));
+            const { blocks } = parseClusterPayload(session, full.subarray(hlen), abs0 + BigInt(hlen));
             routeBlocks(session, blocks, byIdx);
-            spent += BigInt(end - s0);
-            session.readPos = winStart + BigInt(end);
+            spent += elemEnd - abs0;
+            session.readPos = elemEnd;
             continue;
           } catch {
             break;
           }
         }
         // Unknown-size : parse jusqu'au bout de la fenêtre (shortWindow).
-        const { blocks } = parseClusterPayload(session, win.subarray(r.p), winStart + BigInt(r.p));
+        const { blocks } = parseClusterPayload(session, win.subarray(r.p), abs0 + BigInt(hlen));
         routeBlocks(session, blocks, byIdx);
         spent += BigInt(win.length - s0);
         session.readPos = winStart + BigInt(win.length);
@@ -516,22 +531,27 @@ export async function ff_read_frame_multi(session, _packet, opts = {}) {
         if (spent >= limit) return [0, byIdx];
         continue;
       }
-      if (e.id === ID.Cluster && end !== null && end <= win.length) {
-        const { blocks } = parseClusterPayload(session, win.subarray(r.p, end), winStart + BigInt(r.p));
+      if (e.id === ID.Cluster && elemEnd !== null && elemEnd <= winStart + BigInt(win.length)) {
+        const localEnd = Number(elemEnd - winStart);
+        const { blocks } = parseClusterPayload(session, win.subarray(r.p, localEnd), abs0 + BigInt(hlen));
         routeBlocks(session, blocks, byIdx);
-        spent += BigInt(end - s0);
-        session.readPos = winStart + BigInt(end);
-        r.p = end;
+        spent += elemEnd - abs0;
+        session.readPos = elemEnd;
+        r.p = localEnd;
         if (spent >= limit) return [0, byIdx];
         continue;
       }
-      // Métadonnée : avance de ce qui est consommé et rend la main.
-      r.p = end === null || end <= s0 ? (end === null ? win.length : s0 + 1) : Math.min(end, win.length);
-      break;
+      // Métadonnée (Info/Tracks/Chapters/Tags/Attachments/SeekHead/Void…) :
+      // on la SAUTE par sa taille annoncée SANS lire ses données (les Attachments
+      // font des Mo : les télécharger puis les parser comme EBML = saut à l'EOF).
+      if (elemEnd === null) break; // taille inconnue hors Cluster : rien de fiable
+      session.readPos = elemEnd;
+      r.p = Number(elemEnd - winStart);
+      break; // rend la main (prochain appel continue après la métadonnée)
     }
-    // Positionnement absolu (les clusters avancent eux-mêmes + continue ;
-    // ici on consomme le reste de la fenêtre). Jamais de sur-place.
-    session.readPos = winStart + BigInt(r.p > 0 ? r.p : 1);
+    // Positionnement absolu (les clusters avancent eux-mêmes + continue).
+    // Si rien n'a bougé (header illisible en début de fenêtre) : +1 anti-blocage.
+    if (session.readPos <= winStart) session.readPos = winStart + 1n;
     if (Object.keys(byIdx).length || spent >= limit) return [0, byIdx];
   }
 }
