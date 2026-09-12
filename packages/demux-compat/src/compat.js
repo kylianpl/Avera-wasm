@@ -91,7 +91,21 @@ export class CompatLib {
     this.vfs = new Map(); // name -> { size, blocks: Map<start, Uint8Array> }
     this.waiters = new Map(); // `${name}:${start}` -> [{resolve, reject}]
     this.onblockread = null; // posé par worker.js
+    // Constantes (lues comme this.libav.X par worker.js).
+    this.AV_TIME_BASE = AV_TIME_BASE;
+    this.AVSEEK_FLAG_BACKWARD = AVSEEK_FLAG_BACKWARD;
+    this.AVERROR_EOF = AVERROR_EOF;
+    this.EAGAIN = EAGAIN;
+    this.AVMEDIA_TYPE_UNKNOWN = AVMEDIA_TYPE_UNKNOWN;
+    this.AVMEDIA_TYPE_VIDEO = AVMEDIA_TYPE_VIDEO;
+    this.AVMEDIA_TYPE_AUDIO = AVMEDIA_TYPE_AUDIO;
+    this.AVMEDIA_TYPE_DATA = AVMEDIA_TYPE_DATA;
+    this.AVMEDIA_TYPE_SUBTITLE = AVMEDIA_TYPE_SUBTITLE;
+    this.AVMEDIA_TYPE_ATTACHMENT = AVMEDIA_TYPE_ATTACHMENT;
+    this.libavjsMode = "demux-compat (sans libav)";
   }
+  // Espace de noms statique (remplace `LibAV.AVMEDIA_TYPE_*` du worker).
+  // (voir export LibAV plus bas)
   // -- D1 : FS virtuel --
   async mkblockreaderdev(name, size) {
     this.vfs.set(name, { size: BigInt(size), blocks: new Map() });
@@ -181,6 +195,21 @@ export async function ff_init_demuxer_file(lib, name) {
   const idx = await probeSource(source);
   const tracksRaw = await source.read(idx.tracks.off, Number(idx.tracks.size)).then(parseTracks);
   const tracks = tracksRaw.map((t, i) => ({ ...t, index: i }));
+  // Enrichissement (bridge + codecpar) : famille, profil/niveau H264, profil AAC.
+  for (const t of tracks) {
+    const m = mapCodec(t.codecId, t.kind);
+    t.family = m.family;
+    t.ffCodecId = m.id;
+    t.ffCodecType = m.type;
+    t.profile = -1; t.level = -1; t.audioProfile = -1;
+    const priv = t.codecPrivate ?? new Uint8Array(0);
+    t.extradata = priv; // alias : le bridge lit `extradata` (codecPrivate MKV)
+    if (m.family === "h264") {
+      const pl = avcProfileLevel(priv);
+      t.profile = pl.profile; t.level = pl.level;
+    }
+    if (m.family === "aac") t.audioProfile = aacProfile(priv);
+  }
   const segEnd = await findSegmentEnd(lib, name, idx, v.size);
   let chapters = [];
   try {
@@ -198,13 +227,12 @@ export async function ff_init_demuxer_file(lib, name) {
     eof: false,
   };
   const streams = tracks.map((t) => {
-    const m = mapCodec(t.codecId, t.kind);
     return {
       index: t.index,
       number: t.number,
-      codec_type: m.type,
-      codec_id: m.id,
-      codecpar: t, // objet piste interne (ff_copyout_codecpar l'expose)
+      codec_type: t.ffCodecType,
+      codec_id: t.ffCodecId,
+      codecpar: t, // objet piste interne (ff_copyout_codecpar + bridge l'exploitent)
       time_base_num: 1,
       time_base_den: 1000000000,
       metadata: t.name ? { title: t.name } : {},
@@ -225,25 +253,20 @@ async function findSegmentEnd(lib, name, idx, fileSize) {
 
 // ---- D3 : codecpar ----
 export async function ff_copyout_codecpar(track) {
-  const m = mapCodec(track.codecId, track.kind);
   const priv = track.codecPrivate ?? new Uint8Array(0);
-  const out = {
-    family: m.family,
+  return {
+    family: track.family ?? mapCodec(track.codecId, track.kind).family,
     width: Number(track.width || 0),
     height: Number(track.height || 0),
     channels: Number(track.channels || 0),
     channelCount: Number(track.channels || 0),
     sample_rate: Number(track.sampleRate || 0),
     sampleRate: Number(track.sampleRate || 0),
-    profile: -1, level: -1, audioProfile: -1,
+    profile: track.profile ?? -1,
+    level: track.level ?? -1,
+    audioProfile: track.audioProfile ?? -1,
     extradata: priv,
   };
-  if (m.family === "h264") {
-    const pl = avcProfileLevel(priv);
-    out.profile = pl.profile; out.level = pl.level;
-  }
-  if (m.family === "aac") out.audioProfile = aacProfile(priv);
-  return out;
 }
 
 // ---- D5 : durée/métadonnées/chapitres ----
@@ -262,6 +285,31 @@ export async function ff_get_demuxer_chapters(session) {
     metadata: c.title ? { title: c.title } : {},
   }));
 }
+
+// Espace de noms pour `import { LibAV }` (remplace les statiques libav).
+export const LibAV = {
+  AVMEDIA_TYPE_UNKNOWN, AVMEDIA_TYPE_VIDEO, AVMEDIA_TYPE_AUDIO,
+  AVMEDIA_TYPE_DATA, AVMEDIA_TYPE_SUBTITLE, AVMEDIA_TYPE_ATTACHMENT,
+};
+
+// Méthodes d'instance (worker.js appelle this.libav.*) — délégation fine.
+const _m = CompatLib.prototype;
+_m.ff_init_demuxer_file = function (name) { return ff_init_demuxer_file(this, name); };
+_m.ff_read_frame_multi = function (s, p, o) { return ff_read_frame_multi(s, p, o); };
+_m.av_seek_frame = function (s, i, t, a, f) { return av_seek_frame(s, i, t, a, f); };
+_m.avformat_seek_file_max = function (s, i, t, a, f) { return avformat_seek_file_max(s, i, t, a, f); };
+_m.ff_copyout_codecpar = function (t) { return ff_copyout_codecpar(t); };
+_m.avcodec_get_name = function (id) { return avcodec_get_name(id); };
+_m.ff_get_demuxer_chapters = function (s) { return ff_get_demuxer_chapters(s); };
+_m.ff_copyout_dict = function (p) { return ff_copyout_dict(p); };
+_m.AVFormatContext_duration = function (s) { return AVFormatContext_duration(s); };
+_m.AVFormatContext_metadata = function (s) { return AVFormatContext_metadata(s); };
+_m.av_packet_alloc = function () { return av_packet_alloc(); };
+_m.ff_error = function (r) { return ff_error(r); };
+_m.ff_init_decoder = function () { return ff_init_decoder(); };
+_m.ff_decode_multi = function () { return ff_decode_multi(); };
+_m.ff_free_decoder = function () { return ff_free_decoder(); };
+_m.avcodec_flush_buffers = function () { return avcodec_flush_buffers(); };
 
 // ---- D6 : curseur paquet (opaque, compat gère son curseur) ----
 export async function av_packet_alloc() { return {}; }

@@ -1,6 +1,6 @@
 import { RingBuffer } from "./libs/ringbuf.js";
-import * as LibAVJSWebCodecs from "./libav/libavjs-webcodecs-bridge.mjs";
-import LibAV from "./libav/libav-6.9.8.1-player.mjs";
+import * as LibAVJSWebCodecs from "../packages/wc-bridge/src/bridge.js";
+import { CompatLib, LibAV } from "../packages/demux-compat/src/compat.js";
 import {
   WebGLRenderer,
   WebGPURenderer,
@@ -94,8 +94,9 @@ class MediaWorker {
 
   async initLibAV() {
     if (!this.libav) {
-      this.libav = await LibAV.LibAV();
-      console.log(`[worker] libav.js backend: ${LibAV.target()}, mode: ${this.libav.libavjsMode}`);
+      // Compat sans libav (démux maison, voir packages/demux-compat).
+      this.libav = new CompatLib();
+      console.log(`[worker] demux backend: ${this.libav.libavjsMode}`);
     }
   }
 
@@ -844,8 +845,7 @@ class MediaWorker {
     this.ringbuffer = new RingBuffer(this.sharedArrayBuffer, Float32Array);
 
     const audioConfig = await LibAVJSWebCodecs.audioStreamToConfig(
-      this.libav,
-      this.streams[this.audioStreamIndex],
+      this.streams[this.audioStreamIndex].codecpar,
     );
     this.audioConfig = audioConfig;
     if ((await AudioDecoder.isConfigSupported(audioConfig)).supported) {
@@ -927,8 +927,7 @@ class MediaWorker {
   async setupVideoDecoder() {
     this.videoUseWebCodecs = false;
     const videoConfig = await LibAVJSWebCodecs.videoStreamToConfig(
-      this.libav,
-      this.streams[this.videoStreamIndex],
+      this.streams[this.videoStreamIndex].codecpar,
     );
     this.videoConfig = videoConfig;
     let webCodecsSupported = false;
@@ -1481,7 +1480,7 @@ class MediaWorker {
             packet,
             this.streams[this.videoStreamIndex],
           );
-          this.WCVideoDecoder.decode(chunk);
+          this.WCVideoDecoder.decode(new EncodedVideoChunk(chunk));
         } else {
           const frames = await this.libav.ff_decode_multi(
             this.VideoDecoderCodecContext,
@@ -1630,7 +1629,7 @@ class MediaWorker {
             this.streams[this.audioStreamIndex],
           );
           if (!this.WCAudioDecoder) return;
-          this.WCAudioDecoder.decode(chunk);
+          this.WCAudioDecoder.decode(new EncodedAudioChunk(chunk));
         } else {
           if (!this.AudioDecoderCodecContext) return;
           var frames = await this.libav.ff_decode_multi(

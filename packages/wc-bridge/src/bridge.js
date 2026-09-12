@@ -17,7 +17,7 @@ const hx = (b) => (b & 0xff).toString(16).padStart(2, "0");
  *  (pas de hardwareAcceleration/colorSpace/optimizeForLatency) ;
  *  description = extradata VERBATIM ssi extradata && extradata[0] !== 0. */
 export function videoStreamToConfig(t) {
-  const ret = { codec: "unknown", codedWidth: t.width | 0, codedHeight: t.height | 0 };
+  const ret = { codec: "unknown", codedWidth: Number(t.width) | 0, codedHeight: Number(t.height) | 0 };
   const e = t.extradata;
   const verbatimDesc = e && e.length && e[0] !== 0 ? e : null;
   if (t.family === "h264") {
@@ -89,8 +89,8 @@ export function packetToEncodedVideoChunk(pkt) {
 export function audioStreamToConfig(t) {
   const ret = {
     codec: "unknown",
-    sampleRate: t.sampleRate | 0,
-    numberOfChannels: t.channels | 0,
+    sampleRate: Number(t.sampleRate) | 0,
+    numberOfChannels: Number(t.channels) | 0,
   };
   const e = t.extradata;
   if (t.family === "aac") {
@@ -111,8 +111,7 @@ export function audioStreamToConfig(t) {
   return ret;
 }
 
-/** EncodedAudioChunk : type toujours 'key', duration toujours posée, verbatim. */
-export function packetToEncodedAudioChunk(pkt) {
+/** EncodedAudioChunk : type toujours 'key', duration toujours posée, verbatim. */export function packetToEncodedAudioChunk(pkt) {
   const num = pkt.timeBaseNum || 1, den = pkt.timeBaseDen || 1000000;
   return {
     type: "key",
@@ -120,4 +119,10 @@ export function packetToEncodedAudioChunk(pkt) {
     duration: tsUs(pkt.duration || 0, num, den),
     data: new Uint8Array(pkt.data),
   };
+}
+
+/** SW fallback (Phase 4) : convertir une frame décodée libav en VideoFrame.
+ *  Non migré — le chemin WebCodecs est seul pour l'instant. */
+export async function laFrameToVideoFrame() {
+  throw new Error("SW fallback libav : Phase 4 — non migré (WebCodecs uniquement pour l'instant)");
 }

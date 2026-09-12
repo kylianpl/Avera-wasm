@@ -161,6 +161,19 @@ document.addEventListener("DOMContentLoaded", async function () {
   // Wait for samples to load before proceeding
   await waitForSamplesToLoad();
 
+  // Beta : ?src=<url> ajoute/sélectionne une source locale
+  try {
+    const src = new URLSearchParams(location.search).get("src");
+    if (src) {
+      const sel = document.getElementById("video");
+      const o = document.createElement("option");
+      o.value = src;
+      o.textContent = src.split("/").pop() || src;
+      sel.appendChild(o);
+      sel.value = src;
+    }
+  } catch {}
+
   // set the video from local storage if available
   const savedVideo = localStorage.getItem("video");
   if (savedVideo) {
