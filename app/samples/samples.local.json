@@ -1,0 +1,28 @@
+[
+  {
+    "name": "Ice Age — sample 2min (beta local)",
+    "credit": "Beta sample, stream copy",
+    "path": "../media/iceage-sample.mkv",
+    "selected": true
+  },
+  {
+    "name": "Kaguya-sama — sample 2min (beta local)",
+    "credit": "Beta sample, stream copy",
+    "path": "../media/kaguya-sample.mkv"
+  },
+  {
+    "name": "Beta 60s — H264 baseline+opus (sûr Firefox)",
+    "credit": "Beta sample",
+    "path": "../media/beta-60s.mkv"
+  },
+  {
+    "name": "Ice Age — film entier (beta local)",
+    "credit": "Film complet",
+    "path": "../media/iceage-full.mkv"
+  },
+  {
+    "name": "Kaguya-sama — film entier (beta local)",
+    "credit": "Film complet",
+    "path": "../media/kaguya-full.mkv"
+  }
+]

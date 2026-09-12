@@ -498,14 +498,17 @@ document.addEventListener("DOMContentLoaded", async function () {
 // Function to wait for samples to be loaded
 function waitForSamplesToLoad() {
   return new Promise((resolve) => {
+    const t0 = Date.now();
     const checkSamples = () => {
       const videoSelect = document.getElementById("video");
       const options = videoSelect.querySelectorAll("option");
 
-      // Check if samples are loaded (more than just the loading option)
+      // Check if samples are loaded (more than just the loading option).
+      // Timeout de sécurité : la page ne doit jamais rester bloquée (?src=…).
       if (
         options.length > 1 ||
-        (options.length === 1 && !options[0].disabled)
+        (options.length === 1 && !options[0].disabled) ||
+        Date.now() - t0 > 10000
       ) {
         resolve();
       } else {

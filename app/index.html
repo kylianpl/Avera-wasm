@@ -2,6 +2,7 @@
 <html lang="en">
     <head>
         <meta charset="UTF-8" />
+        <link rel="icon" href="data:," />
         <meta name="viewport" content="width=device-width, initial-scale=1.0" />
         <title>AVera Player</title>
         <style>
@@ -175,13 +176,17 @@
             // Load samples from JSON and populate select
             async function loadSamples() {
                 try {
-                    const response = await fetch("./samples/samples.json");
-                    const samples = await response.json();
-                    const localResponse = await fetch("./samples/samples.local.json");
-                    const localSamples = localResponse.ok
-                        ? await localResponse.json()
-                        : [];
-                    samples.push(...localSamples);
+                    // Distant PUIS local, chacun tolérant (la page ne doit jamais
+                    // rester bloquée sur "loading" si un seul manque).
+                    let samples = [];
+                    try {
+                        const response = await fetch("./samples/samples.json");
+                        if (response.ok) samples = await response.json();
+                    } catch {}
+                    try {
+                        const localResponse = await fetch("./samples/samples.local.json");
+                        if (localResponse.ok) samples.push(...await localResponse.json());
+                    } catch {}
                     const videoSelect = document.getElementById("video");
                     const creditMap = {};
 
@@ -210,9 +215,9 @@
                     }
                 } catch (error) {
                     console.error("Failed to load samples:", error);
-                    const videoSelect = document.getElementById("video");
-                    videoSelect.innerHTML =
-                        "<option disabled>Failed to load samples</option>";
+                    // Liste vide mais utilisable (?src= / ajout manuel) :
+                    // jamais d'option disabled seule (bloquerait waitForSamplesToLoad).
+                    document.getElementById("video").innerHTML = "";
                 }
             }
 
