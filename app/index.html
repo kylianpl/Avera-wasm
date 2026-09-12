@@ -161,6 +161,13 @@
             </select>
         </div>
         <div class="controls">
+            <label style="font-size: 13px" title="Force le décodage software (CPU) au lieu du GPU. Contournement du bug d'étirement vertical Firefox <157 sur H264 paddé (VA-API). Sans effet une fois corrigé.">
+                <input type="checkbox" id="forceSW" />
+                Décodage software (contourne
+                <a href="https://bugzilla.mozilla.org/show_bug.cgi?id=2054811" target="_blank" rel="noopener">Firefox #2054811</a>)
+            </label>
+        </div>
+        <div class="controls">
             <p id="credit"></p>
         </div>
         <div id="lagStats">

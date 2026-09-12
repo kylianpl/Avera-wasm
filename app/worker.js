@@ -266,6 +266,7 @@ class MediaWorker {
   // Initialize worker with canvas and video
   async init(data) {
     if (data && data.wasm !== undefined) this._wantWasm = !!data.wasm;
+    if (data && data.forceSW !== undefined) this._forceSW = !!data.forceSW;
     if (data && data.demuxPort) this.demuxPort = data.demuxPort;
     if (data && data.renderPort) {
       this.renderPort = data.renderPort;
@@ -287,6 +288,7 @@ class MediaWorker {
       this._wantWasm = !!data.wasm;
       this.libav = null; // force la réinit (change de backend parse)
     }
+    if (data && data.forceSW !== undefined) this._forceSW = !!data.forceSW;
     this.cancelRenderLoop();
     this.isPlaying = false;
     self.postMessage({ type: "videoStatus", isPlaying: false });
@@ -987,9 +989,16 @@ class MediaWorker {
 
   async setupVideoDecoder() {
     this.videoUseWebCodecs = false;
-    const videoConfig = await LibAVJSWebCodecs.videoStreamToConfig(
+    let videoConfig = await LibAVJSWebCodecs.videoStreamToConfig(
       this.streams[this.videoStreamIndex].codecpar,
     );
+    // Contournement bug Firefox #2054811 (étirement VA-API sur H264 paddé,
+    // fix branche 157) : décodage software forcé (toggle/?sw=1/auto FF<157).
+    // https://bugzilla.mozilla.org/show_bug.cgi?id=2054811
+    if (this._forceSW) {
+      videoConfig = { ...videoConfig, hardwareAcceleration: "prefer-software" };
+      console.log("[decode] software forcé (contournement Firefox #2054811)");
+    }
     this.videoConfig = videoConfig;
     let webCodecsSupported = false;
     try {

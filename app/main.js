@@ -294,6 +294,39 @@ document.addEventListener("DOMContentLoaded", async function () {
   // Transfert : le canvas part au RENDER worker (pixels) ; le decode worker
   // reçoit le port vers lui (frames transférables + clear).
   const wantWasm = new URLSearchParams(location.search).get("nowasm") !== "1";
+  // Contournement bug Firefox #2054811 (étirement VA-API sur H264 paddé,
+  // fix branche 157) : forcer le décodage software. Priorité : ?sw=1/0, puis
+  // choix utilisateur persisté, puis auto-détection (Firefox Linux <157).
+  const qs = new URLSearchParams(location.search);
+  const detectOldFirefoxSW = () => {
+    try {
+      const ua = navigator.userAgent;
+      if (!/Firefox\/\d+/.test(ua)) return false;
+      const m = ua.match(/(?:rv|Firefox)[:/](\d+)/);
+      const v = m ? parseInt(m[1], 10) : 999;
+      return /Linux/.test(ua) && v < 157;
+    } catch {
+      return false;
+    }
+  };
+  let forceSW;
+  if (qs.get("sw") === "1") forceSW = true;
+  else if (qs.get("sw") === "0") forceSW = false;
+  else {
+    const saved = localStorage.getItem("forceSW");
+    forceSW = saved !== null ? saved === "1" : detectOldFirefoxSW();
+  }
+  const swBox = document.getElementById("forceSW");
+  if (swBox) {
+    swBox.checked = forceSW;
+    swBox.addEventListener("change", () => {
+      localStorage.setItem("forceSW", swBox.checked ? "1" : "0");
+      location.reload(); // appliqué à l'ouverture des décodeurs
+    });
+  }
+  if (forceSW) {
+    console.log("[decode] décodage software forcé (?sw=1 / toggle / auto Firefox<157) — contournement https://bugzilla.mozilla.org/show_bug.cgi?id=2054811");
+  }
   renderWorker.postMessage(
     {
       type: "init",
@@ -307,6 +340,7 @@ document.addEventListener("DOMContentLoaded", async function () {
       type: "init",
       video: document.getElementById("video").value || null,
       wasm: wantWasm,
+      forceSW,
       renderPort: avChannel.port1,
       demuxPort: demuxChannel.port1,
     },
