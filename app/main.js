@@ -396,11 +396,11 @@ document.addEventListener("DOMContentLoaded", async function () {
       mediaClockStartTime = performance.now() + performance.timeOrigin;
       if (isPlaying) await startAudio();
     } else if (e.data.type === "avDrift") {
-      if (audioContext) {
-        const driftMs = e.data.driftMs;
-        if (Math.abs(driftMs) > 150) {
-          lastOffsetMediaTime += Math.sign(driftMs) * 0.001 * Math.min(50, Math.abs(driftMs) * 0.05);
-        }
+      // Diagnostic seul : on NE recale plus l'horloge sur la dérive (la boucle
+      // "+" embalait le temps : retard vidéo → saut avant → plus de retard).
+      // Le retard se purge par drops (présentation), jamais par saut d'horloge.
+      if (Math.abs(e.data.driftMs) > 500) {
+        console.warn(`[av] drift soutenu ${Math.round(e.data.driftMs)}ms (purge par drops)`);
       }
     } else if (e.data.type === "workerLagReport") {
       const fpsCounter = document.getElementById("fpsCounter");

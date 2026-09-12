@@ -1401,10 +1401,11 @@ class MediaWorker {
   }
 
   needsMorePackets(type) {
-    // Seuils d'origine uniquement (60 paquets / 16Mo). Tenté : plafonner
-    // l'avance au présent (pacing x1) — mais tout gate côté production affame
-    // ce décodeur (qui veut un flux soutenu, pas du goutte-à-goutte) et fige
-    // tout. La fraîcheur reste gérée à la présentation (dû/périmé).
+    // Seuils d'origine uniquement (60 paquets / 16Mo). Tenté à deux reprises
+    // de brider le démux (plafond au présent, puis oldest-gate) : à chaque fois
+    // pire — ce décodeur exige un flux soutenu et meurt affamé (fatal
+    // EncodingError après ~10s de disette, irréversible). Le démux ne suit QUE
+    // ces compteurs ; la présentation (dû/périmé sur horloge saine) trie.
     if (type === "video") {
       return this.videoStreamIndex !== -1 &&
         this.videoPacketQueue.length < this.PACKET_QUEUE_MIN_SIZE &&
