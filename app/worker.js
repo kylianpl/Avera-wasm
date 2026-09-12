@@ -1,8 +1,20 @@
 import { RingBuffer } from "./libs/ringbuf.js";
 import * as LibAVJSWebCodecs from "../packages/wc-bridge/src/bridge.js";
-import { CompatLib, LibAV } from "../packages/demux-compat/src/compat.js";
+import { LibAV } from "../packages/demux-compat/src/compat.js";
+import {
+  ff_copyout_codecpar as ff_copyout_codecpar_raw,
+  avcodec_get_name as avcodec_get_name_raw,
+  ff_error as ff_error_raw,
+  ff_init_decoder as ff_init_decoder_raw,
+  ff_decode_multi as ff_decode_multi_raw,
+  ff_free_decoder as ff_free_decoder_raw,
+  avcodec_flush_buffers as avcodec_flush_buffers_raw,
+} from "../packages/demux-compat/src/compat.js";
 // Note Phase 3/Slice 1 : le rendu vit dans render-worker.js (VideoFrames
 // transférables). Ici : décisions de présentation + envoi (jamais de pixels).
+// Note Phase 3/Slice 2 : le démux vit dans demux-worker.js. `this.libav` est
+// une FAÇADE (mêmes noms/mêmes signatures) : I/O + lecture via RPC, pur en
+// direct. Les call sites ne changent pas.
 
 class MediaWorker {
   constructor() {
@@ -67,9 +79,7 @@ class MediaWorker {
     this.renderRafId = null;
     this.pipelinePumpScheduled = false;
     this.generation = 0;
-    this.sourceName = null;
-    this.sourceAbortController = null;
-    this.sourceRangePromises = new Map();
+    this.sourceName = null; // legacy (I/O côté demux-worker) : gardé, inutilisé
     this.seekSerial = 0;
     this.audioPrerollTargetSeconds = null;
     this.lastAVDifference = 0;
@@ -92,16 +102,103 @@ class MediaWorker {
     this.initLibAV();
   }
 
+  // Client RPC vers demux-worker (Slice 2) : corrélation par id + timeout.
+  demuxCall(op, payload = {}, transfer = []) {
+    const port = this.demuxPort;
+    if (!port) return Promise.reject(new Error("demux non connecté"));
+    if (!this._demuxSeq) {
+      this._demuxSeq = 0;
+      this._demuxPending = new Map();
+      port.onmessage = (e) => {
+        const d = e.data;
+        if (!d || d.id === undefined) return;
+        const w = this._demuxPending.get(d.id);
+        if (!w) return;
+        this._demuxPending.delete(d.id);
+        clearTimeout(w.timer);
+        if (d.ok) w.resolve(d);
+        else w.reject(new Error(d.error || op));
+      };
+    }
+    const id = ++this._demuxSeq;
+    return new Promise((resolve, reject) => {
+      const timer = setTimeout(() => {
+        this._demuxPending.delete(id);
+        reject(new Error(`demux ${op} timeout`));
+      }, 30000);
+      this._demuxPending.set(id, { resolve, reject, timer });
+      try {
+        port.postMessage({ id, op, gen: this.demuxGen ?? 0, ...payload }, transfer);
+      } catch (err) {
+        this._demuxPending.delete(id);
+        clearTimeout(timer);
+        reject(err);
+      }
+    });
+  }
+
+  // Façade this.libav : mêmes noms que libav.js. I/O + lecture via RPC vers
+  // demux-worker ; pur (codecpar/noms/consts/erreurs) en direct.
+  buildDemuxFacade() {
+    const self = this;
+    const openCache = { durationTicks: -1, chapters: [] };
+    self._openCache = openCache;
+    return {
+      onblockread: null, // sans objet (I/O côté demux-worker)
+      AV_TIME_BASE: 1000000,
+      AVSEEK_FLAG_BACKWARD: 1,
+      AVERROR_EOF: -541478725,
+      EAGAIN: 11,
+      AVMEDIA_TYPE_UNKNOWN: -1,
+      AVMEDIA_TYPE_VIDEO: 0,
+      AVMEDIA_TYPE_AUDIO: 1,
+      AVMEDIA_TYPE_DATA: 2,
+      AVMEDIA_TYPE_SUBTITLE: 3,
+      AVMEDIA_TYPE_ATTACHMENT: 4,
+      async mkblockreaderdev() { return 0; },
+      async unlink() { return 0; },
+      async ff_block_reader_dev_send() { return 0; },
+      async ff_init_demuxer_file() {
+        const r = await self.demuxCall("open", { url: self._openUrl, wasm: self._wantWasm ?? true });
+        openCache.durationTicks = Number(r.durationNs) >= 0 ? Math.round(Number(r.durationNs) / 1000) : -1;
+        openCache.chapters = r.chapters ?? [];
+        self.formatContext = { url: self._openUrl };
+        return [self.formatContext, r.streams];
+      },
+      async ff_read_frame_multi() {
+        // Remplacé par readDemuxPackets (quotas + génération) — appel direct interdit.
+        throw new Error("ff_read_frame_multi: passer par readDemuxPackets");
+      },
+      async av_seek_frame(fc, stream, ts) {
+        self.demuxGen = (self.demuxGen ?? 0) + 1;
+        const r = await self.demuxCall("seek", { streamIdx: stream, ns: String(ts), gen: self.demuxGen });
+        return r.res ?? 0;
+      },
+      async avformat_seek_file_max(fc, stream, ts) {
+        self.demuxGen = (self.demuxGen ?? 0) + 1;
+        const r = await self.demuxCall("seek", { streamIdx: stream, ns: String(ts), gen: self.demuxGen });
+        return r.res ?? 0;
+      },
+      async ff_copyout_codecpar(t) { return ff_copyout_codecpar_raw(t); },
+      avcodec_get_name(id) { return avcodec_get_name_raw(id); },
+      async ff_error(r) { return ff_error_raw(r); },
+      async AVFormatContext_duration() { return openCache.durationTicks; },
+      async AVFormatContext_metadata() { return 0; },
+      async ff_copyout_dict() { return {}; },
+      async ff_get_demuxer_chapters() { return openCache.chapters; },
+      async av_packet_alloc() { return {}; },
+      async ff_init_decoder() { return ff_init_decoder_raw(); },
+      async ff_decode_multi() { return ff_decode_multi_raw(); },
+      async ff_free_decoder() { return ff_free_decoder_raw(); },
+      async avcodec_flush_buffers() { return avcodec_flush_buffers_raw(); },
+    };
+  }
+
   async initLibAV() {
     if (!this.libav) {
-      // Compat sans libav (démux maison, voir packages/demux-compat).
-      this.libav = new CompatLib();
-      try {
-        const ok = await this.libav.init({ wasm: this._wantWasm ?? true });
-        console.log(`[worker] demux backend: demux-compat (sans libav) + ${ok ? "parse WASM" : "parse JS"}`);
-      } catch {
-        console.log(`[worker] demux backend: demux-compat (sans libav) + parse JS`);
-      }
+      // Plus de libav ici : façade RPC (le démux tourne dans demux-worker).
+      this.libav = this.buildDemuxFacade();
+      console.log(`[worker] demux backend: demux-worker (RPC)`);
     }
   }
 
@@ -160,6 +257,7 @@ class MediaWorker {
   // Initialize worker with canvas and video
   async init(data) {
     if (data && data.wasm !== undefined) this._wantWasm = !!data.wasm;
+    if (data && data.demuxPort) this.demuxPort = data.demuxPort;
     if (data && data.renderPort) {
       this.renderPort = data.renderPort;
       this.renderPort.onmessage = (e) => {
@@ -335,83 +433,22 @@ class MediaWorker {
 
   async openSeekableSource(videoURL, generation) {
     await this.cleanupSource();
-    const url = new URL(videoURL, self.location.href).href;
-    const head = await fetch(url, { method: "HEAD" });
-    if (!head.ok) {
-      throw new Error(`Failed to probe media: ${head.statusText}`);
-    }
-
-    const size = Number(head.headers.get("content-length"));
-    if (!Number.isFinite(size) || size <= 0) {
-      throw new Error("Media server did not provide Content-Length");
-    }
-
-    const sourceName = `source-${generation}`;
-    this.sourceName = sourceName;
-    this.sourceAbortController = new AbortController();
-    this.sourceRangePromises.clear();
-
-    // Read in 1MB blocks to amortize HTTP round-trip overhead.
-    // AVI demuxing triggers many tiny reads (8-byte headers); without this
-    // each becomes a separate HTTP Range request (~200ms on localhost).
-    const blockSize = 1024 * 1024;
-    this.libav.onblockread = (filename, pos, length) => {
-      if (!String(filename).endsWith(sourceName) || generation !== this.generation) return;
-      const blockStart = Math.floor(pos / blockSize) * blockSize;
-      const fetchLen = Math.min(blockSize, size - blockStart);
-      this.fetchSourceRange(url, sourceName, blockStart, fetchLen, generation).catch((e) => {
-        if (generation !== this.generation) return;
-        console.error("Range fetch failed:", e);
-        this.libav.ff_block_reader_dev_send(sourceName, pos, null, { errorCode: -1 });
-      });
-    };
-
-    await this.libav.mkblockreaderdev(sourceName, size);
-  }
-
-  async fetchSourceRange(url, sourceName, pos, length, generation) {
-    const end = pos + length - 1;
-    const key = `${pos}:${length}`;
-    if (this.sourceRangePromises.has(key)) {
-      return this.sourceRangePromises.get(key);
-    }
-
-    const promise = (async () => {
-      const response = await fetch(url, {
-        headers: { Range: `bytes=${pos}-${end}` },
-        signal: this.sourceAbortController?.signal,
-      });
-      if (generation !== this.generation) return;
-      if (!response.ok && response.status !== 206) {
-        throw new Error(`HTTP ${response.status} for range ${pos}-${end}`);
-      }
-      let data = new Uint8Array(await response.arrayBuffer());
-      if (response.status === 200) {
-        data = data.subarray(pos, pos + length);
-      }
-      await this.libav.ff_block_reader_dev_send(sourceName, pos, data);
-    })().finally(() => {
-      this.sourceRangePromises.delete(key);
-    });
-
-    this.sourceRangePromises.set(key, promise);
-    return promise;
+    // L'I/O vit dans demux-worker : ici on ne retient que l'URL (résolue).
+    // Le HEAD + Range + VFS ont lieu dans demux.open (mêmes erreurs).
+    this._openUrl = new URL(videoURL, self.location.href).href;
+    this.sourceName = `source-${generation}`;
   }
 
   async cleanupSource() {
-    if (this.sourceAbortController) {
-      this.sourceAbortController.abort();
-      this.sourceAbortController = null;
+    // Fermeture côté demux-worker (best-effort) + reset du token local.
+    try {
+      this.demuxGen = (this.demuxGen ?? 0) + 1;
+      await this.demuxCall("close", { gen: this.demuxGen });
+    } catch {
+      // Déjà parti après un init/reinit raté.
     }
-    this.sourceRangePromises.clear();
-    if (this.libav && this.sourceName) {
-      try {
-        await this.libav.unlink(this.sourceName);
-      } catch (e) {
-        // It may already be gone after a failed init/reinit.
-      }
-      this.sourceName = null;
-    }
+    this.formatContext = null;
+    this.sourceName = null;
   }
 
   streamTimestamp(seconds, streamIndex) {
@@ -1412,31 +1449,40 @@ class MediaWorker {
       this.packet = await this.libav.av_packet_alloc();
     }
     if (!this.formatContext) return;
-    const [res, packets] = await this.libav.ff_read_frame_multi(
-      this.formatContext,
-      this.packet,
-      { limit },
-    );
-    if (res < 0 && res != -this.libav.EAGAIN) {
-      if (res === this.libav.AVERROR_EOF) {
-        this.fileEnded = true;
-        return false;
-      }
-      console.error("Error reading frame:", await this.libav.ff_error(res));
+    // Remplit par RPC (quotas calés sur needsMorePackets) : le demux lit des
+    // clusters, on enfile localement. Génération : ignore les réponses périmées.
+    const vNeed = this.videoStreamIndex === -1 ? 0
+      : Math.max(0, Math.min(64, this.PACKET_QUEUE_MIN_SIZE - this.videoPacketQueue.length));
+    const aNeed = this.audioStreamIndex === -1 ? 0
+      : Math.max(0, Math.min(64, this.PACKET_QUEUE_MIN_SIZE - this.audioPacketQueue.length));
+    if (!vNeed && !aNeed) return true;
+    const gen = this.demuxGen ?? 0;
+    let r;
+    try {
+      r = await this.demuxCall("read", {
+        gen,
+        videoIdx: this.videoStreamIndex,
+        audioIdx: this.audioStreamIndex,
+        videoN: vNeed,
+        audioN: aNeed,
+      });
+    } catch (e) {
+      console.error("Error reading frame:", e?.message ?? e);
       return false;
     }
-    let gotPackets = false;
-    if (packets[this.videoStreamIndex]) {
-      for (const packet of packets[this.videoStreamIndex]) {
-        this.enqueuePacket("video", packet);
-        gotPackets = true;
-      }
+    if (r.gen !== gen) return true; // périmé (seek entre-temps) : on ignore, on continue
+    if (r.eof) {
+      this.fileEnded = true;
+      return (r.video?.length ?? 0) + (r.audio?.length ?? 0) > 0;
     }
-    if (packets[this.audioStreamIndex]) {
-      for (const packet of packets[this.audioStreamIndex]) {
-        this.enqueuePacket("audio", packet);
-        gotPackets = true;
-      }
+    let gotPackets = false;
+    for (const packet of r.video ?? []) {
+      this.enqueuePacket("video", packet);
+      gotPackets = true;
+    }
+    for (const packet of r.audio ?? []) {
+      this.enqueuePacket("audio", packet);
+      gotPackets = true;
     }
     return gotPackets;
   }

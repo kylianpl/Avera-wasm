@@ -154,11 +154,20 @@ document.addEventListener("DOMContentLoaded", async function () {
 
   const worker = new Worker("worker.js", { type: "module" });
   window.__avWorker = worker; // debug beta (stats…)
-  // Slice 1 Phase 3 : render worker séparé (pixels) + canal decode→render
-  // (VideoFrames transférables + clear). Le canvas part au render worker.
+  // Slice 2 Phase 3 : démux worker séparé. Canaux :
+  // avChannel : decode → render (frames) ; demuxChannel : decode ↔ demux (RPC).
   const renderWorker = new Worker("render-worker.js", { type: "module" });
   window.__avRenderWorker = renderWorker; // debug beta
+  const demuxWorker = new Worker("demux-worker.js", { type: "module" });
+  window.__avDemuxWorker = demuxWorker; // debug beta
+  // Les erreurs workers ne remontent pas sinon (silence total au boot).
+  for (const [w, n] of [[worker, "decode"], [renderWorker, "render"], [demuxWorker, "demux"]]) {
+    w.onerror = (e) => console.error(`[${n}-worker]`, e.message ?? e);
+    w.onmessageerror = (e) => console.error(`[${n}-worker] messageerror`, e);
+  }
   const avChannel = new MessageChannel();
+  const demuxChannel = new MessageChannel();
+  demuxWorker.postMessage({ type: "init", port: demuxChannel.port2 }, [demuxChannel.port2]);
   renderWorker.onmessage = (e) => {
     if (e.data && e.data.type === "renderReady") {
       console.log(`[render] ready, backend=${e.data.backend}`);
@@ -299,8 +308,9 @@ document.addEventListener("DOMContentLoaded", async function () {
       video: document.getElementById("video").value || null,
       wasm: wantWasm,
       renderPort: avChannel.port1,
+      demuxPort: demuxChannel.port1,
     },
-    [avChannel.port1],
+    [avChannel.port1, demuxChannel.port1],
   );
 
   // Listen for messages from the worker
