@@ -115,11 +115,33 @@ document.getElementById("run").onclick = async () => {
       out(`${hw}: support=${sup.supported}`);
       return sup.supported;
     };
-    // HW + WebGL
+    // HW + WebGL : présentation rythmée rAF (comme une vraie lecture — le bug
+    // est intermittent : surface-copy (sain) vs zéro-copy (squishé) selon la
+    // pression GPU ; une rafale synchrone ne le déclenche pas pareil).
     const hwc = document.getElementById("hw"), hwz = document.getElementById("hwz");
     const hx = hwz.getContext("2d");
     const { gl, tex } = glSetup(hwc);
     const supHW = await mkDec("prefer-hardware");
+    // Mesure par frame : dessine + readback synchrone + compte les lignes vertes.
+    // (readPixels DOIT suivre le draw dans la même tâche : pas de preserveDrawingBuffer.)
+    const px = new Uint8Array(480 * 270 * 4);
+    async function presentAndMeasure(frames, drawOne) {
+      let squished = 0;
+      for (const f of frames) {
+        drawOne(f);
+        gl.readPixels(0, 0, 480, 270, gl.RGBA, gl.UNSIGNED_BYTE, px);
+        let green = 0;
+        for (let y = 262; y < 270; y++)
+          for (let x = 0; x < 480; x += 7) {
+            const o = (y * 480 + x) * 4;
+            if (px[o + 1] > 100 && px[o + 1] > px[o] + 40 && px[o + 1] > px[o + 2] + 40) { green++; break; }
+          }
+        if (green > 0) squished++;
+        try { f.close(); } catch {}
+        await new Promise((r) => requestAnimationFrame(r)); // laisse compositer
+      }
+      return squished;
+    }
     let greenRows = 0, nHW = 0;
     if (supHW) {
       const frames = [];
@@ -132,29 +154,23 @@ document.getElementById("run").onclick = async () => {
       await dec2.flush().catch(() => {});
       nHW = frames.length;
       out(`HW: ${nHW} frames décodées`);
-      for (const f of frames) {
+      greenRows = await presentAndMeasure(frames, (f) => {
         gl.bindTexture(gl.TEXTURE_2D, tex);
         gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, f);
         gl.viewport(0, 0, 480, 270);
         gl.drawArrays(gl.TRIANGLE_FAN, 0, 4);
-        f.close();
-      }
-      // Bandeau bas ×8 + comptage vert (readback synchrone, même tâche).
+      });
+      out(`HW: frames squishées (0 attendu si sain) = ${greenRows}/${nHW}`);
+      // Bandeau bas ×8 de la dernière image.
       hx.clearRect(0, 0, 480, 80);
       hx.drawImage(hwc, 0, 270 - 34, 480, 34, 0, 0, 480, 80);
-      const px = new Uint8Array(480 * 270 * 4);
-      gl.readPixels(0, 0, 480, 270, gl.RGBA, gl.UNSIGNED_BYTE, px);
-      for (let y = 262; y < 270; y++)
-        for (let x = 0; x < 480; x += 7) {
-          const o = (y * 480 + x) * 4;
-          if (px[o + 1] > 100 && px[o + 1] > px[o] + 40 && px[o + 1] > px[o + 2] + 40) { greenRows++; break; }
-        }
-      out(`HW: lignes vertes en bas (0 attendu si sain) = ${greenRows}/8`);
     }
-    // SW + 2d (référence)
+    // SW + 2d (référence) : même mesure par frame (auto-test du harnais :
+    // le SW ne doit JAMAIS squisher, même headless sans HW).
     const swc = document.getElementById("sw"), swz = document.getElementById("swz");
     const sx = swc.getContext("2d"), sxz = swz.getContext("2d");
     const supSW = await mkDec("prefer-software");
+    let swSquished = -1;
     if (supSW) {
       const frames = [];
       const d2 = new VideoDecoder({ output: (f) => { frames.push(f); }, error: (e) => out("SW err: " + e.message) });
@@ -162,12 +178,26 @@ document.getElementById("run").onclick = async () => {
       samples.forEach((s, i) => d2.decode(new EncodedVideoChunk({ type: i === 0 ? "key" : "delta", timestamp: i * 66667, data: s })));
       await d2.flush().catch(() => {});
       out(`SW: ${frames.length} frames décodées`);
-      const last = frames[frames.length - 1];
-      if (last) { sx.drawImage(last, 0, 0, 480, 270); sxz.drawImage(swc, 0, 270 - 34, 480, 34, 0, 0, 480, 80); }
-      frames.forEach((f) => { try { f.close(); } catch {} });
+      swSquished = 0;
+      const spx = new Uint8Array(480 * 270 * 4);
+      for (const f of frames) {
+        sx.drawImage(f, 0, 0, 480, 270);
+        const id = sx.getImageData(0, 262, 480, 8);
+        let green = 0;
+        for (let y = 0; y < 8 && !green; y++)
+          for (let x = 0; x < 480; x += 7) {
+            const o = (y * 480 + x) * 4;
+            if (id.data[o + 1] > 100 && id.data[o + 1] > id.data[o] + 40 && id.data[o + 1] > id.data[o + 2] + 40) { green = 1; break; }
+          }
+        if (green) swSquished++;
+        try { f.close(); } catch {}
+        await new Promise((r) => requestAnimationFrame(r));
+      }
+      out(`SW: frames squishées (doit être 0) = ${swSquished}/${frames.length}`);
+      sxz.drawImage(swc, 0, 270 - 34, 480, 34, 0, 0, 480, 80);
     }
-    out(greenRows > 0 ? "❌ BUG REPRODUIT (bande verte côté HW)" : "✅ pas de bande verte (fixé ou pas de HW)");
-    window.__repro = { nHW, greenRows };
+    out(greenRows > 0 ? `❌ BUG REPRODUIT (${greenRows}/${nHW} frames HW squishées)` : "✅ pas de squish HW détecté (fixé, pas de HW, ou intermittence ratée)");
+    window.__repro = { nHW, greenRows, swSquished };
   } catch (e) {
     out("ERREUR: " + (e?.message ?? e));
   }
