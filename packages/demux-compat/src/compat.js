@@ -232,6 +232,7 @@ export async function ff_init_demuxer_file(lib, name) {
     lib, name, size: v.size, segOff: idx.segOff, segEnd,
     timecodeScale: idx.timecodeScale, durationNs: idx.durationNs,
     tracks, chapters, cues: null, cuesScanned: false,
+    seekEntries: idx.seek ?? [],
     readPos: idx.firstClusterOff ?? idx.segOff,
     firstClusterOff: idx.firstClusterOff ?? idx.segOff,
     eof: false,
@@ -423,8 +424,40 @@ function parseBlockGroup(session, payload, clusterTicks) {
 async function ensureCues(session) {
   if (session.cuesScanned) return session.cues ?? [];
   session.cuesScanned = true;
+  const parsePayload = (payload) => {
+    if (wasmMod) {
+      try {
+        return wasmMod.parseCues(payload, Number(session.timecodeScale)).map((c) => ({
+          timeNs: BigInt(Math.trunc(c.timeNs)),
+          track: BigInt(Math.trunc(c.track)),
+          clusterPos: BigInt(Math.trunc(c.clusterPos)),
+        }));
+      } catch {}
+    }
+    return parseCues(payload, session.timecodeScale);
+  };
   try {
-    // Retrouve l'élément Cues : balayage borné depuis la fin (Cues en queue).
+    // 1) SeekHead : position EXACTE des Cues (pas de devinette de queue —
+    //    les Cues d'un long film dépassent la fenêtre de balayage, et un
+    //    balayage qui les rate fait retomber le seek à 0).
+    const se = (session.seekEntries ?? []).find((s) => s.id === ID.Cues);
+    if (se) {
+      const off = session.segOff + BigInt(se.pos);
+      const hb = await session.lib.read(session.name, off, 16);
+      const hr = new Reader(hb);
+      const he = hr.elem();
+      if (he.id === ID.Cues && he.size !== null && he.size > 0n) {
+        const payload = await session.lib.read(session.name, off + BigInt(hr.p), Number(he.size));
+        if (payload.length === Number(he.size)) {
+          const cues = parsePayload(payload);
+          if (cues.length) {
+            session.cues = cues;
+            return session.cues;
+          }
+        }
+      }
+    }
+    // 2) Balayage borné de la queue (fichiers sans SeekHead).
     const tail = 2 * 1048576;
     const start = session.segEnd > BigInt(tail) ? session.segEnd - BigInt(tail) : 0n;
     const buf = await session.lib.read(session.name, start, Number(session.segEnd - start));
@@ -436,18 +469,7 @@ async function ensureCues(session) {
       catch { break; }
       const end = e.size === null ? buf.length : Math.min(buf.length, r.p + Number(e.size));
       if (e.id === ID.Cues) {
-        const payload = buf.subarray(r.p, end);
-        if (wasmMod) {
-          try {
-            session.cues = wasmMod.parseCues(payload, Number(session.timecodeScale)).map((c) => ({
-              timeNs: BigInt(Math.trunc(c.timeNs)),
-              track: BigInt(Math.trunc(c.track)),
-              clusterPos: BigInt(Math.trunc(c.clusterPos)),
-            }));
-            break;
-          } catch {}
-        }
-        session.cues = parseCues(payload, session.timecodeScale);
+        session.cues = parsePayload(buf.subarray(r.p, end));
         break;
       }
       r.p = end <= s0 ? s0 + 1 : end;
