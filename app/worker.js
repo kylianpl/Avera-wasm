@@ -233,8 +233,7 @@ class MediaWorker {
         break;
       case "stats":
         // Debug beta : compteurs instantanés (inaudible en prod).
-        self.postMessage({
-          type: "statsReport",
+        self.postMessage({          type: "statsReport",
           vFed: this._vFed ?? 0,
           vOut: this._vOut ?? 0,
           vQ: this.videoPacketQueue.length,

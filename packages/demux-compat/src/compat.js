@@ -452,6 +452,7 @@ async function ensureCues(session) {
           const cues = parsePayload(payload);
           if (cues.length) {
             session.cues = cues;
+            session._cuesVia = "seekhead";
             return session.cues;
           }
         }
@@ -470,6 +471,7 @@ async function ensureCues(session) {
       const end = e.size === null ? buf.length : Math.min(buf.length, r.p + Number(e.size));
       if (e.id === ID.Cues) {
         session.cues = parsePayload(buf.subarray(r.p, end));
+        session._cuesVia = "tail";
         break;
       }
       r.p = end <= s0 ? s0 + 1 : end;
