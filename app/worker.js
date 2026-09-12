@@ -834,22 +834,24 @@ class MediaWorker {
       self.postMessage({ type: "buffering", buffering: false });
       return;
     }
+    if (serial !== this.seekSerial) return;
 
-    // Read the actual timestamp of the first packet for audio sync
-    let packet = queue[0];
-    let seekedTime = currentTime;
-    if (packet && packet.pts >= 0) {
-      seekedTime =
-        (packet.pts * packet.time_base_num) / packet.time_base_den;
-    }
-
-    this.pausedVideoTime = currentTime * 1000;
+    // Même queue de reprise qu'un seek (cf. seek()) : preroll vidéo pour
+    // choisir displayTime, puis TOUT (horloge vidéo, preroll audio, offset
+    // main) ancré dessus. Avant : pas de preroll + offsetMediaTime sur le
+    // premier paquet (secondes d'écart) = désync permanente.
+    const displayTime = await this.prerollVideoTo(currentTime, serial);
+    if (serial !== this.seekSerial) return;
+    this.pausedVideoTime = displayTime * 1000;
     if (this.isPlaying) {
       this.videoTimeStart = performance.now();
     }
+    this.audioPrerollTargetSeconds = this.audioStreamIndex !== -1 ? displayTime : null;
+    await this.primeAudioBuffer(serial);
+    if (serial !== this.seekSerial) return;
     this.isSeeking = false;
     self.postMessage({ type: "buffering", buffering: false });
-    self.postMessage({ type: "offsetMediaTime", mediaTime: seekedTime });
+    self.postMessage({ type: "offsetMediaTime", mediaTime: displayTime });
 
     // Restart decoder feeds
     if (this.isPlaying) {
