@@ -59,7 +59,10 @@ class MediaWorker {
 
     this.DATA_BUFFER_DURATION = 4.0;
     this.DATA_BUFFER_DECODE_TARGET_DURATION = 2.0;
-    this.DECODER_QUEUE_SIZE_MAX = 5;
+    this.DECODER_QUEUE_SIZE_MAX = 24; // file decodeur profonde (~1s) : les
+    // décodeurs qui émettent par rafales se coincent nourris au compte-gouttes
+    // (observé : 3/s plafonné à 5, 145/s en flood). La présentation (dû/périmé)
+    // trie les sorties ; pas de gate fraîcheur artificielle ici.
     this.FRAME_BUFFER_TARGET_SIZE = 5;
     this.PACKET_QUEUE_MIN_SIZE = 60;
     this.PACKET_QUEUE_MAX_BYTES = 16 * 1024 * 1024;
@@ -247,6 +250,8 @@ class MediaWorker {
           fileEnded: this.fileEnded,
           playing: this.isPlaying,
           renderDrawn: this._renderDrawn ?? 0,
+          posted: this._posted ?? 0,
+          staleDropped: this._staleDropped ?? 0,
         });
         break;
       default:
@@ -1396,6 +1401,8 @@ class MediaWorker {
   }
 
   needsMorePackets(type) {
+    // Seuils d'origine (60 paquets / 16Mo) : le staging absorbe l'avance
+    // démux, la présentation (dû/périmé) trie. Pas de gate fraîcheur ici.
     if (type === "video") {
       return this.videoStreamIndex !== -1 &&
         this.videoPacketQueue.length < this.PACKET_QUEUE_MIN_SIZE &&
@@ -1569,12 +1576,27 @@ class MediaWorker {
         "bufferVideoFrame called while seeking (output of video decoder)",
       );
     this._vOut = (this._vOut ?? 0) + 1;
+    this._lastVOutT = performance.now();
     this.videoFrameBuffer.push(frame);
     this.schedulePipelinePump();
   }
 
   renderVideoLoop() {
     if (!this.isPlaying || this.isSeeking) return;
+    // Chien de garde : décodeur muet avec du travail en attente (file paquets
+    // non vide, rien ne sort depuis 10s alors que ça a déjà démarré) → reset
+    // + reconfigure + vide les files (périmées de toute façon). Sans ça, un
+    // décodeur coincé fige l'image pour toujours (vu en beta).
+    try {
+      const stalled = (this._vOut ?? 0) > 0 &&
+        performance.now() - (this._lastVOutT ?? 0) > 10000 &&
+        (this.videoPacketQueue.length > 0 || (this.videoFrameBuffer?.length ?? 0) > 0);
+      if (stalled) {
+        console.warn("[decode] stall vidéo 10s DÉTECTÉ (reset désactivé en diagnostic)");
+        this._lastVOutT = performance.now(); // répit 10s avant prochain signalement
+        this.schedulePipelinePump();
+      }
+    } catch {}
     const now = performance.now();
     const lm = this.lagMonitor;
 
@@ -1618,7 +1640,8 @@ class MediaWorker {
       this.videoFrameBuffer[0].timestamp < currentTime - VSYNC_INTERVAL
     ) {
       let staleFrame = this.videoFrameBuffer.shift();
-      staleFrame.close();
+      try { staleFrame.close(); } catch {}
+      this._staleDropped = (this._staleDropped ?? 0) + 1;
     }
 
     // Envoi au render worker (transfert zéro-copie) UNIQUEMENT si la tête a
@@ -1634,6 +1657,7 @@ class MediaWorker {
     this._lastSentPts = pts;
     try {
       this.renderPort.postMessage({ type: "frame", frame: head }, [head]);
+      this._posted = (this._posted ?? 0) + 1;
     } catch {
       this._lastSentPts = null;
     }
