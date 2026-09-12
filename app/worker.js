@@ -551,7 +551,7 @@ class MediaWorker {
   async refillUntilPacketsAvailable(queue, serial, timeoutMs = 1500) {
     const start = performance.now();
     while (queue.length === 0 && !this.fileEnded && serial === this.seekSerial) {
-      await this.readDemuxPackets(256 * 1024);
+      await this.readDemuxPackets(256 * 1024, serial);
       if (queue.length > 0 || this.fileEnded) break;
       if (performance.now() - start > timeoutMs) return false;
       await new Promise((r) => setTimeout(r, 5));
@@ -1334,7 +1334,13 @@ class MediaWorker {
 
   async pumpPipeline() {
     if (!this.formatContext || this.isSeeking) return;
+    // Fencing d'époque : si un seek a eu lieu pendant les awaits ci-dessous,
+    // on abandonne (sinon l'ancien et le nouveau flux se mélangent : paquets
+    // d'avant-seek nourris au décodeur reset → "needs a key chunk" + positions
+    // atterrissant n'importe où — vu en beta surtout sans pause).
+    const ep = this.seekSerial;
     if (this.audioStreamIndex !== -1) await this.feedAudioDecoder();
+    if (ep !== this.seekSerial) return;
     if (this.videoStreamIndex !== -1) await this.feedVideoDecoder();
   }
 
@@ -1449,6 +1455,7 @@ class MediaWorker {
   async refillFrameQueuesInternal() {
     // Video step 1/4: fill videoPacketQueue with demuxed packets
     // Audio step 1/4: fill audioPacketQueue with demuxed packets
+    const ep = this.seekSerial; // fencing d'époque (cf. pumpPipeline)
     if (!this.needsMorePackets("video") && !this.needsMorePackets("audio")) {
       return;
     }
@@ -1461,20 +1468,22 @@ class MediaWorker {
     }
     while (this.needsMorePackets("video") || this.needsMorePackets("audio")) {
       const gotPackets = await this.readDemuxPackets(512 * 1024);
+      if (ep !== this.seekSerial) return; // seek entre-temps : on abandonne
       if (this.fileEnded) return;
       if (!gotPackets) break;
     }
   }
 
-  async readDemuxPackets(limit) {
+  async readDemuxPackets(limit, serial = this.seekSerial) {
     if (!this.packet) {
       this.packet = await this.libav.av_packet_alloc();
     }
     if (!this.formatContext) return;
     // Remplit par RPC : le demux retourne tout ce qu'il parse (borné ~2Mo/RPC),
     // on enfile (les seuils needsMorePackets bornent le staging côté decode).
-    // Génération : ignore les réponses périmées.
+    // Génération : ignore les réponses périmées (seek entre-temps).
     const gen = this.demuxGen ?? 0;
+    const ep = this.seekSerial;
     let r;
     try {
       r = await this.demuxCall("read", {
@@ -1486,6 +1495,7 @@ class MediaWorker {
       console.error("Error reading frame:", e?.message ?? e);
       return false;
     }
+    if (ep !== this.seekSerial || serial !== this.seekSerial) return false; // périmé : on jette, on continue
     if (r.gen !== gen) return true; // périmé (seek entre-temps) : on ignore, on continue
     if (r.pos != null) this._demuxPos = r.pos; // debug beta (traçage EOF fantôme)
     if (r.eof) {
@@ -1515,6 +1525,9 @@ class MediaWorker {
 
   async feedVideoDecoderInternal() {
     try {
+      // (fencing d'époque : voir pumpPipeline — un seek entre deux awaits
+      // invalide tout ce qui suit)
+      const ep = this.seekSerial;
       if (!this.formatContext) {
         console.warn("Format context not initialized");
         return;
@@ -1536,6 +1549,7 @@ class MediaWorker {
         (this.audioStreamIndex !== -1 && this.audioPacketQueue.length === 0)
       ) {
         await this.refillFrameQueues();
+        if (ep !== this.seekSerial) return; // seek entre-temps : paquets périmés
       }
       let packet = null;
       while (this.videoFrameBuffer.length < this.FRAME_BUFFER_TARGET_SIZE) {
@@ -1548,6 +1562,7 @@ class MediaWorker {
         }
         if (this.videoPacketQueue.length === 0) {
           await this.refillFrameQueues();
+          if (ep !== this.seekSerial) return; // seek entre-temps : paquets périmés
           if (this.videoPacketQueue.length === 0) {
             break;
           }
@@ -1694,6 +1709,7 @@ class MediaWorker {
   async feedAudioDecoderInternal() {
     // Audio step 2/3: send the demuxed audio packets to the audio decoder
     // Based on https://github.com/w3c/webcodecs/blob/724b7d620519450c0c9630ab4eb97fe555f9007b/samples/lib/audio_renderer.js#L83
+    const ep = this.seekSerial; // fencing d'époque (cf. pumpPipeline)
     if (this.audioStreamIndex === -1 || !this.ringbuffer) return;
     if (this.audioUseWebCodecs && !this.WCAudioDecoder) return;
     if (!this.audioUseWebCodecs && !this.AudioDecoderCodecContext) return;
@@ -1728,6 +1744,7 @@ class MediaWorker {
       ) {
         if (this.audioPacketQueue.length === 0) {
           await this.refillFrameQueues();
+          if (ep !== this.seekSerial) return; // seek entre-temps : paquets périmés
           if (this.audioPacketQueue.length === 0) {
             console.warn("No more audio packets available");
             break;

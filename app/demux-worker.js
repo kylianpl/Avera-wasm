@@ -20,6 +20,18 @@ let abort = null;
 let rangePromises = new Map();
 let port = null;
 
+// Sérialisation des opérations (mutex à chaîne de promesses) : sans ça, un
+// read en vol (await fetch) s'entrelace avec un seek et avance readPos au
+// milieu de la nouvelle position (paquets mélangés, keyframes manqués).
+// mpv fait pareil avec son verrou demux (demux_seek). Coût : un seek attend
+// la fin du read en cours (quelques ms).
+let opTail = Promise.resolve();
+function serialized(fn) {
+  const run = opTail.then(fn);
+  opTail = run.catch(() => {});
+  return run;
+}
+
 const BLOCK = 1048576;
 
 async function fetchBlock(blockStart, fetchLen, gen) {
@@ -81,11 +93,11 @@ self.onmessage = async (e) => {
   if (!d || d.id === undefined) {
     if (d && d.type === "init") {
       port = d.port ?? null;
-      if (port) port.onmessage = (ev) => handleRpc(ev.data);
+      if (port) port.onmessage = (ev) => serialized(() => handleRpc(ev.data));
     }
     return;
   }
-  handleRpc(d);
+  serialized(() => handleRpc(d));
 };
 
 async function handleRpc(d) {
