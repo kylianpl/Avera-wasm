@@ -15,7 +15,10 @@ const useTls = argv("--tls", null) !== null;
 const ROOT = new URL(".", import.meta.url).pathname;
 const MIME = {
   ".js": "text/javascript", ".mjs": "text/javascript", ".html": "text/html",
-  ".json": "application/json", ".mkv": "video/x-matroska", ".mp4": "video/mp4",
+  ".json": "application/json", ".mkv": "video/x-matroska", ".webm": "video/webm",
+  ".mp4": "video/mp4", ".m4v": "video/x-m4v", ".mov": "video/quicktime",
+  ".m4a": "audio/mp4", ".m4s": "video/iso.segment", ".mp3": "audio/mpeg",
+  ".avi": "video/x-msvideo", ".ac3": "audio/ac3", ".ec3": "audio/eac3",
   ".wasm": "application/wasm",
 };
 

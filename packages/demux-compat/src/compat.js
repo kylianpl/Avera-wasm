@@ -203,6 +203,31 @@ export async function ff_init_demuxer_file(lib, name) {
     read: (off, len) => lib.read(name, off, len),
     getSize: async () => v.size,
   };
+  // Routeur de conteneur : EBML (MKV/WebM) ou ftyp (MP4/MOV/fMP4).
+  const head = await source.read(0n, 16);
+  if (sniffMp4(head)) {
+    const opened = await openMp4(source);
+    const session = {
+      kind: "mp4",
+      lib, name, size: v.size, segOff: 0n, segEnd: v.size,
+      timecodeScale: 1000000n, durationNs: opened.durationNs,
+      tracks: opened.tracks, chapters: [],
+      cues: null, cuesScanned: true, seekEntries: [],
+      readPos: opened.mp4readPos, firstClusterOff: opened.mp4readPos,
+      eof: false, mp4: opened,
+    };
+    const streams = opened.tracks.map((t) => ({
+      index: t.index,
+      number: t.number,
+      codec_type: t.ffCodecType,
+      codec_id: t.ffCodecId,
+      codecpar: t,
+      time_base_num: 1,
+      time_base_den: 1000000000,
+      metadata: {},
+    }));
+    return [session, streams];
+  }
   const idx = await probeSource(source);
   const tracksRaw = await source.read(idx.tracks.off, Number(idx.tracks.size)).then(parseTracks);
   const tracks = tracksRaw.map((t, i) => ({ ...t, index: i }));
@@ -230,6 +255,7 @@ export async function ff_init_demuxer_file(lib, name) {
     }
   } catch {}
   const session = {
+    kind: "mkv",
     lib, name, size: v.size, segOff: idx.segOff, segEnd,
     timecodeScale: idx.timecodeScale, durationNs: idx.durationNs,
     tracks, chapters, cues: null, cuesScanned: false,
@@ -483,6 +509,12 @@ async function ensureCues(session) {
 
 // ---- D7 : lecture bornée → paquets par index de stream ----
 export async function ff_read_frame_multi(session, _packet, opts = {}) {
+  if (session.kind === "mp4") {
+    const r = await readMp4(session, session.lib, session.name, opts);
+    if (r.res < 0) return [r.res, r.byIdx];
+    if (r.eof) return Object.keys(r.byIdx).length ? [0, r.byIdx] : [AVERROR_EOF, r.byIdx];
+    return [0, r.byIdx];
+  }
   const limit = BigInt(opts.limit ?? 524288);
   const byIdx = {};
   if (session.eof) return [-541478725, byIdx];
@@ -620,6 +652,15 @@ function coerceTs(ts) {
   return BigInt(Math.floor(n));
 }
 async function seekNs(session, targetNs) {
+  if (session.kind === "mp4") {
+    try {
+      seekMp4(session, targetNs);
+      session.eof = false;
+      return 0;
+    } catch {
+      return -1;
+    }
+  }
   try {
     const cues = await ensureCues(session);
     if (!cues.length) {
@@ -642,6 +683,7 @@ async function seekNs(session, targetNs) {
 // Remplace les stubs : HEVC → session libde265 (frames I420 format 0 que
 // libavFrameToVideoFrame sait rendre). Audio : non migré (WebCodecs suffit).
 import * as SW from "../../sw-decode/src/index.js";
+import { sniffMp4, openMp4, readMp4, seekMp4 } from "../../mp4-demux/src/index.js";
 
 export async function ff_init_decoder(codec_id, codecpar) {
   const name = avcodec_get_name(Number(codec_id));

@@ -91,12 +91,20 @@ worker dédié) refusés. Retenu : **build maison decode-only FFmpeg 8.1.2
 Branchée dans `compat.js` (`ff_init_decoder` 86019/86055). Validée
 navigateur (MKV h264+eac3 : 94/94 paquets décodés, seek propre).
 
-### Containers MP4 + MP3 — À FAIRE (décidé)
-- `packages/mp4-demux` (maison-JS) : moov (moov-first + moov-at-end via
-  range-reader) + **fMP4** (moof/traf), tables stts/ctts/stsc/stsz/stco/
-  co64/stss, paquets en ordre de décodage avec vrais pts/dts (B-frames),
-  extradata avcC/hvcC/esds/dac3/dec3 pour le bridge, seek via stss.
+### Containers MP4 — FAIT (tests 21/21 ✔)
+- `packages/mp4-demux` (maison-JS, 100% original) : moov-first + moov-at-end
+  (balayage d'en-têtes range-reader) + **fMP4** (moof/traf), tables
+  stts/ctts/stsc/stsz/stz2/stco/co64/stss, paquets en ordre de décodage
+  avec vrais pts/dts (B-frames), extradata avcC/hvcC/esds→ASC/dac3/dec3,
+  seek binaire sur dts + recul keyframe (vidéo), edit list mono-segment
+  (parité ffprobe : premiers pts/dts négatifs tolérés par le worker).
+- Routeur dans `ff_init_demuxer_file` (sniff EBML vs ftyp) + dispatch
+  read/seek par `session.kind` ; contrat paquets/streams inchangé.
+- Fixtures : mp4-avc-aac, mp4-moov-tail, mp4-frag (3 moofs), mp4-hevc-eac3
+  (exerce les deux fallbacks SW à la fois).
+- Validé navigateur : AVC/AAC (WebCodecs), HEVC+EAC3 (double SW),
+  fMP4 — seeks delta 0, aucun warning.
+
+### Container MP3 — À FAIRE
 - `packages/mp3-demux` : ID3v2 + sync frames + Xing/TOC, chemin UI
-  audio-only à vérifier.
-- Routeur de sniff dans `ff_init_demuxer_file` (EBML/ftyp/RIFF/ID3+sync),
-  même contrat paquets/streams. AVI reporté.
+  audio-only à vérifier. AVI reporté.
