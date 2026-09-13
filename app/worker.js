@@ -315,7 +315,7 @@ class MediaWorker {
     this.audioPrerollTargetSeconds = null;
     this.pausedVideoTime = 0;
     this.videoTimeStart = performance.now();
-    this.renderer?.clear?.();
+    this.postRenderClear(); // render-worker oublie son image (le clear main passe par self, ignoré)
 
     await this.playerInit(data.video);
     if (this.formatContext) {

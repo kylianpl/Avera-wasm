@@ -177,6 +177,23 @@ document.addEventListener("DOMContentLoaded", async function () {
   let mediaClockStartTime = performance.now() + performance.timeOrigin;
   let mediaClockStartSeconds = 0;
   let availableStreams = null;
+  // Changement de source : l'horloge audio doit repartir de 0 sur le
+  // (potentiellement nouveau) AudioContext. Sans ça, si initializeAudio
+  // recrée le contexte (sampleRate différent : iceage 48kHz → kaguya 44.1kHz),
+  // lastOffsetMediaTime garde -l'ancienCurrentTime (négatif large) et
+  // getMediaTime() reste clampé à 0 : son OK, temps 00:00, vidéo figée sur la
+  // 1re frame (horloge worker écrasée à 0 toutes les 200ms) puis stall 10s.
+  let pendingSourceReset = false;
+  function rebaseAudioClockToZero() {
+    if (audioContext) {
+      const lat = (audioContext.outputLatency || 0) + (audioContext.baseLatency || 0);
+      lastOffsetMediaTime = lat - audioContext.currentTime;
+    } else {
+      lastOffsetMediaTime = 0;
+    }
+    mediaClockStartSeconds = 0;
+    mediaClockStartTime = performance.now() + performance.timeOrigin;
+  }
 
   // Wait for samples to load before proceeding
   await waitForSamplesToLoad();
@@ -245,6 +262,7 @@ document.addEventListener("DOMContentLoaded", async function () {
     totalTime = 0;
     mediaClockStartSeconds = 0;
     mediaClockStartTime = performance.now() + performance.timeOrigin;
+    pendingSourceReset = true; // rebase horloge à l'arrivée (cf. initFinished/audioConfig)
     // Reinit (changement de source) : le render oublie son image.
   worker.postMessage({
       type: "reinit",
@@ -371,6 +389,13 @@ document.addEventListener("DOMContentLoaded", async function () {
         e.data.sampleRate,
         e.data.sharedArrayBuffer,
       );
+      // Nouvelle source (contexte éventuellement recréé ci-dessus) : repartir
+      // de 0 sur CE contexte. Switch de piste en pause : ne pas toucher
+      // (pas de pendingSourceReset, l'offsetMediaTime du worker recale).
+      if (pendingSourceReset && !isPlaying) {
+        rebaseAudioClockToZero();
+        pendingSourceReset = false;
+      }
       // Changement de piste en cours de lecture : le nouveau nœud doit être
       // branché/démarré (le chemin normal passe par videoStatus, absent ici).
       if (isPlaying) await startAudio();
@@ -380,6 +405,12 @@ document.addEventListener("DOMContentLoaded", async function () {
       totalTime = e.data.duration;
       mediaClockStartSeconds = 0;
       mediaClockStartTime = performance.now() + performance.timeOrigin;
+      // Source sans piste audio : aucun audioConfig à venir, on rebase ici.
+      // Avec audio : le rebase attend audioConfig (contexte final).
+      if (pendingSourceReset && !isPlaying && e.data.availableStreams.audio.length === 0) {
+        rebaseAudioClockToZero();
+        pendingSourceReset = false;
+      }
       document.getElementById("duration").textContent = formatTime(
         e.data.duration,
       );
