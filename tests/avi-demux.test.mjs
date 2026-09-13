@@ -56,7 +56,7 @@ function correlation(pcm, ch, channels, freq, sr) {
 }
 
 describe("avi-demux", () => {
-  it("open h264-mp3 → streams, avcC reconstruit, durée 3s", async () => {
+  it("open h264-mp3 → streams, avcC reconstruit, durée 3.04s", async () => {
     const { session, streams } = await openFile(FIX("avi-h264-mp3.avi"));
     assert.equal(session.kind, "avi");
     assert.ok(session.avi.hasIndex);
@@ -77,7 +77,7 @@ describe("avi-demux", () => {
     assert.equal(ca.sample_rate, 48000);
     assert.equal(ca.channels, 2);
     const dur = await AVFormatContext_duration(session);
-    assert.ok(Math.abs(dur / AV_TIME_BASE - 3.0) < 0.1, `durée=${dur / AV_TIME_BASE}`);
+    assert.ok(Math.abs(dur / AV_TIME_BASE - 3.04) < 0.1, `durée=${dur / AV_TIME_BASE}`); // 76 ticks (vide inclus)
   });
 
   it("read h264-mp3 → 75v+126a, paquets avcc, 3 clés", async () => {
@@ -88,8 +88,10 @@ describe("avi-demux", () => {
     assert.equal(v.length, 75);
     assert.equal(a.length, 126);
     assert.ok(v[0].key && v[0].pts === 0);
+    // Le chunk vide ffmpeg (file1) consomme un tick : pts 0,80,120… (ffprobe).
+    assert.equal(v[1].pts, 80000000);
     for (let i = 1; i < v.length; i++) assert.ok(v[i].dts >= v[i - 1].dts);
-    assert.equal(v.filter((p) => p.key).length, 3); // IDR à 0,25,50 (-bf 0, -g 25)
+    assert.equal(v.filter((p) => p.key).length, 3); // IDR à file0,26,51 (-bf 0, -g 25)
     for (const p of v) {
       // Length-prefixed (pas de start code) : u32BE == reste du paquet (1re NAL).
       assert.ok(p.data.length > 4);
@@ -115,7 +117,7 @@ describe("avi-demux", () => {
     assert.equal(res, AVERROR_EOF);
   });
 
-  it("seek 1.5s → clé 1.0s, 50v restants, audio continu jusqu'au bout", async () => {
+  it("seek 1.5s → clé 1.04s, 50v restants, audio continu jusqu'au bout", async () => {
     const { session, streams } = await openFile(FIX("avi-h264-mp3.avi"));
     const vIdx = streams.find((s) => s.codec_type === AVMEDIA_TYPE_VIDEO).index;
     const aIdx = streams.find((s) => s.codec_type === AVMEDIA_TYPE_AUDIO).index;
@@ -123,7 +125,7 @@ describe("avi-demux", () => {
     assert.equal(await av_seek_frame(session, vIdx, 1500000000n, 0, 0), 0);
     const { v, a } = await readAll(session, vIdx, aIdx);
     assert.ok(v.length > 0 && v[0].key);
-    assert.equal(v[0].dts, 1000000000); // k=25
+    assert.equal(v[0].dts, 1040000000); // k=file26 (vide en file1 : 26×40ms)
     assert.equal(v.length, 50);
     assert.ok(a.length > 0);
     assert.ok(a[0].pts <= 1500000000 && a[0].pts > 1300000000);
@@ -180,7 +182,7 @@ describe("avi-demux", () => {
     }
   });
 
-  it("xvid → conteneur OK (75v+126a), décodage refusé proprement", async () => {
+  it("xvid → conteneur OK (75v+126a), décodage SW mpeg4", async () => {
     const { session, streams } = await openFile(FIX("avi-xvid-mp3.avi"));
     const v = streams.find((s) => s.codec_type === AVMEDIA_TYPE_VIDEO);
     const a = streams.find((s) => s.codec_type === AVMEDIA_TYPE_AUDIO);
@@ -189,7 +191,18 @@ describe("avi-demux", () => {
     const { v: vv, a: aa } = await readAll(session, v.index, a.index);
     assert.equal(vv.length, 75);
     assert.equal(aa.length, 126);
-    await assert.rejects(ff_init_decoder(v.codec_id, v.codecpar), /non migré/);
+    // Chemin decode complet (détails bit-exacts : tests/sw-decode-mp4v).
+    const [, ctx] = await ff_init_decoder(v.codec_id, v.codecpar);
+    try {
+      const out = await ff_decode_multi(ctx, {}, {}, vv.slice(0, 3));
+      assert.equal(out.length, 3);
+      assert.equal(out[0].format, 0);
+      assert.equal(out[0].width, 640);
+      assert.equal(out[0].height, 360);
+      assert.equal(out[0].data.length, 640 * 360 * 3 / 2);
+    } finally {
+      await ff_free_decoder(ctx);
+    }
   });
 
   it("sans idx1 → lecture complète, seek dégradé à 0", async () => {

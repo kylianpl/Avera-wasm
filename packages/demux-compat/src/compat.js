@@ -54,7 +54,8 @@ function mapCodec(codecId, kind) {
 }
 
 const CODEC_NAMES = {
-  7: "mjpeg", 27: "h264", 173: "hevc", 139: "vp8", 167: "vp9", 32797: "av1", 12: "mp4v",
+  7: "mjpeg", 4: "h263", 14: "msmpeg4v1", 15: "msmpeg4v2", 16: "msmpeg4v3",
+  27: "h264", 173: "hevc", 139: "vp8", 167: "vp9", 32797: "av1", 12: "mp4v",
   30: "theora", 86017: "mp3", 86016: "mp2", 86018: "aac", 86019: "ac3", 86055: "eac3",
   86022: "opus", 86021: "vorbis", 86028: "flac", 65536: "pcm", 94225: "subrip", 94226: "ass",
 };
@@ -784,7 +785,28 @@ export async function ff_init_decoder(codec_id, codecpar) {
       console.log("[sw-dec] pont PCM logiciel activé");
       return [null, ctx, {}, {}];
     }
-    throw new Error(`SW fallback non migré pour ${name} (Phase 4 : HEVC + (E)AC3 + PCM)`);
+    if (name === "mp4v" || name === "h263" || name === "msmpeg4v1" ||
+        name === "msmpeg4v2" || name === "msmpeg4v3" || name === "mjpeg") {
+      // Famille MPEG-4 ASP et cousins (XVID/DIVX/H.263/DivX3/MJPEG).
+      // Noms décodeurs FFmpeg (le v3 s'enregistre "msmpeg4", particularité).
+      // MKV VFW : le fourcc réel est dans le BITMAPINFOHEADER (priv+16).
+      const DECODERS = { mp4v: "mpeg4", msmpeg4v3: "msmpeg4" };
+      let decoder = DECODERS[name] ?? name;
+      try {
+        const priv = codecpar?.codecPrivate ?? codecpar?.extradata;
+        const cid = codecpar?.codecId ?? "";
+        if (name === "mp4v" && String(cid).startsWith("V_MS/VFW") && priv?.length >= 20) {
+          const fcc = String.fromCharCode(priv[16], priv[17], priv[18], priv[19]);
+          if (fcc === "DIV3" || fcc === "MP43" || fcc === "MPG3") decoder = "msmpeg4v3";
+          else if (fcc === "DIV4" || fcc === "MP42") decoder = "msmpeg4v2";
+          else if (fcc === "DIV2" || fcc === "MP41") decoder = "msmpeg4v1";
+        }
+      } catch {}
+      const ctx = await SW.createMP4VSession(codecpar, decoder);
+      console.log(`[sw-dec] décodeur logiciel ${decoder} activé (WASM FFmpeg)`);
+      return [null, ctx, {}, {}];
+    }
+    throw new Error(`SW fallback non migré pour ${name} (Phase 4 : HEVC + (E)AC3 + PCM + MPEG-4/H.263/MJPEG)`);
   }
   const ctx = await SW.createHEVCSession(codecpar);
   console.log("[sw-dec] libde265 : décodage logiciel HEVC activé (WASM)");

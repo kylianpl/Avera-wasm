@@ -37,3 +37,13 @@ originaux : `eac3_create/decode/flush/free`, sortie float entrelacée,
 DRC désactivée (`drc_scale=0` : plein niveau, bit-exact après flush).
 Utilisé comme décodeur logiciel de secours AC-3/E-AC-3 (WebCodecs ne les
 expose pas) ; AC-3 inclus gratis (même famille de décodeurs).
+
+`packages/sw-decode/vendor/mp4v/` contient `mp4v.mjs`, build WebAssembly
+**decode-only** des décodeurs natifs `mpeg4` + `h263` + `msmpeg4v1/v2/v3` +
+`mjpeg` de FFmpeg 8.1.2 (`libavcodec` + `libavutil`,
+**LGPL-2.1-or-later** — source :
+https://ffmpeg.org/releases/ffmpeg-8.1.2.tar.xz, non modifiée).
+Même recette que `vendor/eac3` (voir `vendor/mp4v/BUILD.md`) ; pont C
+`bridge.c` original (slots, I420 dense, rééchantillonnage 422/444→420).
+Utilisé comme décodeur logiciel de secours MPEG-4 ASP (XVID/DIVX),
+H.263, DivX 3 et MJPEG — jamais exposés par WebCodecs.

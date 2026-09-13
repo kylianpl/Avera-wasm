@@ -20,6 +20,7 @@ import { splitAnnexB, avccToAnnexB } from "../../mkv-demux/src/annexb.js";
 
 export { EAC3Session, createEAC3Session } from "./eac3.js";
 export { createPCMSession } from "./pcm.js";
+export { MP4VSession, createMP4VSession } from "./mp4v.js";
 export { splitAc3Frames, ac3FrameSize, ac3FrameSamples, ac3Bsid } from "./ac3frames.js";
 
 const WASM_URL = new URL("../vendor/libde265/libde265.wasm", import.meta.url);

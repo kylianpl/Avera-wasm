@@ -270,7 +270,11 @@ async function applyIdx1(source, idx1, movi, tracks) {
     const flags = (buf[o + 4] | (buf[o + 5] << 8) | (buf[o + 6] << 16)) + buf[o + 7] * 0x1000000;
     const off = (buf[o + 8] | (buf[o + 9] << 8) | (buf[o + 10] << 16)) + buf[o + 11] * 0x1000000;
     const sz = (buf[o + 12] | (buf[o + 13] << 8) | (buf[o + 14] << 16)) + buf[o + 15] * 0x1000000;
-    if (sz === 0) continue; // padding vide (ex. 00dc de tête ffmpeg)
+    if (sz === 0) {
+      // Chunk vide (padding d'encodeur, ex. ffmpeg) : gardé pour l'ordinal
+      // (il consomme un tick de présentation, cf. ffprobe : pts 0,80,120…),
+      // mais n'émettra aucun paquet.
+    }
     const si = streamIdxFromId(id, tracks.length);
     if (si < 0) continue;
     // Vérifie la base : l'en-tête sur place doit correspondre (id + taille).
@@ -299,12 +303,11 @@ async function walkMovi(source, movi, fileSize, tracks) {
   const stack = [{ off: movi.payloadOff, end: end > fileSize ? fileSize : end }];
   let guard = 0;
   const push = (off, size, id) => {
-    if (size === 0) return;
     const si = streamIdxFromId(id, tracks.length);
     if (si < 0) return;
     const suf = id.slice(2);
     if (suf !== "dc" && suf !== "db" && suf !== "wb") return; // 'tx'/autres : sautés (v1)
-    tracks[si].chunks.push({ off: off + 8n, size, key: false, id });
+    tracks[si].chunks.push({ off: off + 8n, size, key: false, id }); // vides inclus (ordinal)
   };
   while (stack.length && guard++ < MAX_MOVI_CHUNKS) {
     const { off, end: e } = stack.pop();
@@ -459,6 +462,12 @@ export async function readAvi(session, lib, name, opts = {}) {
     }
     const t = tracks[bi];
     const c = t.chunks[t.cursor];
+    if (c.size === 0) {
+      // Chunk vide (padding) : consomme l'ordinal, n'émet rien.
+      t.cursor++;
+      session.readPos = c.off;
+      continue;
+    }
     let data;
     try {
       data = await lib.read(name, c.off, c.size);
@@ -483,7 +492,7 @@ export async function readAvi(session, lib, name, opts = {}) {
 
 function packetsForChunk(t, c, data, hasIndex) {
   if (t.ffCodecType === T_VIDEO) {
-    const ord = t.cursor; // chunks non-vides seuls → ordinal = n° frame
+    const ord = t.cursor; // ordinal fichier (vides inclus : parité ffprobe)
     const pts = t.frameDurNs > 0n ? Number(BigInt(ord) * t.frameDurNs) : 0;
     let payload = data;
     let key = c.key;
@@ -591,14 +600,17 @@ export async function seekAvi(session, lib, name, targetNs) {
       let ord = Number(BigInt(targetNs < 0n ? 0n : targetNs) / dur);
       if (ord < 0) ord = 0;
       if (ord >= t.chunks.length) ord = t.chunks.length - 1;
+      // Recul keyframe en sautant les vides, puis avance past les vides
+      // (atterrir sur un vide casserait l'amorçage du décodeur).
       let k = ord;
-      while (k > 0 && !t.chunks[k].key) k--;
-      if (!t.chunks[k].key) {
+      while (k > 0 && (!t.chunks[k].key || t.chunks[k].size === 0)) k--;
+      if (!t.chunks[k].key || t.chunks[k].size === 0) {
         k = 0;
-        while (k < t.chunks.length && !t.chunks[k].key) k++;
+        while (k < t.chunks.length && (!t.chunks[k].key || t.chunks[k].size === 0)) k++;
         if (k >= t.chunks.length) k = Math.min(ord, t.chunks.length - 1);
       }
-      t.cursor = Math.max(0, k);
+      while (k < t.chunks.length && t.chunks[k].size === 0) k++;
+      t.cursor = Math.min(Math.max(0, k), t.chunks.length);
     } else {
       // Audio : unité = échantillons @sr.
       const sr = t.timescale || t.sampleRate || 1;

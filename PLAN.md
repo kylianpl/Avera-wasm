@@ -113,9 +113,11 @@ navigateur (MKV h264+eac3 : 94/94 paquets décodés, seek propre).
   fichier), sans idx1 : balayage séquentiel (lecture OK, seek → reprise
   à 0 documentée).
 - Vidéo : H264 Annex B → avcc (`annexbToAvcc` existant), avcC reconstruit
-  des SPS/PPS in-band (strd-avcC accepté), pts=dts=ordinal (pas de ctts
-  en AVI → fixtures -bf 0 ; B-frames non présentables, documenté).
-  Autres fourcc verbatim (XVID→mp4v parsé, décodage non migré).
+  des SPS/PPS in-band (strd-avcC accepté), pts=dts=ordinal (les vides
+  consomment un tick, parité ffprobe : pts 0,80,120… + durée 3.04s ;
+  pas de ctts en AVI → fixtures -bf 0 ; B-frames non présentables).
+  XVID/DIVX → mp4v **décodé en SW** (voir ci-dessous), autres fourcc
+  verbatim.
 - Audio : MP3 découpé en frames, (E)AC-3 verbatim (1 chunk multi-frames
   OK), PCM verbatim, AAC/ADTS découpé (+ASC strf ou synthétisé LC) ;
   pts cumulés exacts (pas d'estimation), tags 0xFFFE/inconnus sniffés.
@@ -126,10 +128,23 @@ navigateur (MKV h264+eac3 : 94/94 paquets décodés, seek propre).
   data/size → buffer dupliqué dans la transfer list → postMessage qui
   jette le batch) — corrigé + assertion buffers-uniques en test.
 - Validé navigateur : h264+mp3 (WebCodecs), h264+ac3 (SW), h264+pcm
-  (pont), seeks delta 0, zéro warning ; XVID : conteneur OK, refus
-  propre "non migré" (cohérent avec les autres codecs non supportés).
+  (pont), xvid+mp3 (SW mpeg4, 59fps), seeks delta 0, zéro warning.
 - Limites v1 : OpenDML/AVIX, seek sans idx1, B-frames AVI, sous-titres
   'tx', AAC-in-AVI non testé sur fixture réelle (code présent, ASC strf).
+
+### Vidéo MPEG-4 ASP et cousins — FAIT (tests 40/40 ✔)
+Build maison decode-only FFmpeg 8.1.2 (`mpeg4` + `h263` + `msmpeg4v1/v2/v3`
++ `mjpeg`, LGPL-2.1-or-later, 779 Ko SINGLE_FILE) — `vendor/mp4v/`
+(`bridge.c` + `BUILD.md` + `mp4v.mjs`). `MP4VSession` : I420 dense au
+format libav (422/444→420 dans le pont, 400→gris+128). Pièges trouvés
+par les tests : facteurs de sous-échantillonnage inversés (luma exacte,
+chroma fausse), MSMPEG4 veut ses dimensions avant ouverture, le v3
+s'enregistre `msmpeg4` (pas `msmpeg4v3`), le natif duplique une frame
+(chunk vide → réf mappée i<2→i, i≥2→i+1). Références natives MD5
+bit-exactes (xvid/h263/mjpeg420), moyennes + déterminisme (422/444),
+reprise post-seek bit-exacte depuis clé. Branché dans `compat.js`
+(`mp4v`→mpeg4, VFW-affiné, h263/msmpeg4/mjpeg) : XVID/DIVX/DivX3/H.263/
+MJPEG jouables (MKV VFW et MP4-mp4v inclus gratis).
 
 ### Container MP3 — FAIT (tests 27/27 ✔)
 - `packages/mp3-demux` (maison-JS, 100% original) : ID3v2 (sauf

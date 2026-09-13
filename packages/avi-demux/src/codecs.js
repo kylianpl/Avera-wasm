@@ -10,13 +10,19 @@ const VIDEO_FOURCC = {
   AVC1: "h264", avc1: "h264", DAVC: "h264", VSSH: "h264",
   XVID: "mp4v", xvid: "mp4v", DIVX: "mp4v", divx: "mp4v",
   DX50: "mp4v", dx50: "mp4v", MP4V: "mp4v", mp4v: "mp4v", FMP4: "mp4v",
+  "3IV1": "mp4v", "3iv1": "mp4v", "3IV2": "mp4v",
+  DIV3: "msmpeg4v3", div3: "msmpeg4v3", MP43: "msmpeg4v3", mp43: "msmpeg4v3",
+  MPG3: "msmpeg4v3", DIV4: "msmpeg4v2", MP42: "msmpeg4v2",
+  DIV2: "msmpeg4v1", MP41: "msmpeg4v1",
+  H263: "h263", h263: "h263",
   VP80: "vp8", VP8: "vp8",
   MJPG: "mjpeg", mjpg: "mjpeg",
   DVSD: "dvvideo", dvsd: "dvvideo",
   THEO: "theora", theo: "theora",
 };
 export const VIDEO_IDS = {
-  h264: 27, mp4v: 12, vp8: 139, mjpeg: 7, dvvideo: 24, theora: 30,
+  h264: 27, mp4v: 12, h263: 4, msmpeg4v1: 14, msmpeg4v2: 15, msmpeg4v3: 16,
+  vp8: 139, mjpeg: 7, dvvideo: 24, theora: 30,
 };
 
 // Tags WAVE (wFormatTag) → famille. 0xFFFE/0xFFFF : sniffé sur les données.
