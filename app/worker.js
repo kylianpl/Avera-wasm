@@ -1526,10 +1526,7 @@ class MediaWorker {
     if (ep !== this.seekSerial || serial !== this.seekSerial) return false; // périmé : on jette, on continue
     if (r.gen !== gen) return true; // périmé (seek entre-temps) : on ignore, on continue
     if (r.pos != null) this._demuxPos = r.pos; // debug beta (traçage EOF fantôme)
-    if (r.eof) {
-      this.fileEnded = true;
-      return (r.video?.length ?? 0) + (r.audio?.length ?? 0) > 0;
-    }
+    if (r.eof) this.fileEnded = true;
     let gotPackets = false;
     for (const packet of r.video ?? []) {
       this.enqueuePacket("video", packet);
