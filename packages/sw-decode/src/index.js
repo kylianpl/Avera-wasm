@@ -18,6 +18,8 @@
 import initialize from "../vendor/libde265/libde265.mjs";
 import { splitAnnexB, avccToAnnexB } from "../../mkv-demux/src/annexb.js";
 
+export { EAC3Session, createEAC3Session } from "./eac3.js";
+
 const WASM_URL = new URL("../vendor/libde265/libde265.wasm", import.meta.url);
 
 let modulePromise = null;

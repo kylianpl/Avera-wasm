@@ -646,7 +646,12 @@ import * as SW from "../../sw-decode/src/index.js";
 export async function ff_init_decoder(codec_id, codecpar) {
   const name = avcodec_get_name(Number(codec_id));
   if (name !== "hevc") {
-    throw new Error(`SW fallback non migré pour ${name} (Phase 4 : HEVC seulement)`);
+    if (name === "ac3" || name === "eac3") {
+      const ctx = await SW.createEAC3Session(codecpar?.family ? codecpar : { ...codecpar, family: name });
+      console.log("[sw-dec] décodeur logiciel audio activé (WASM FFmpeg)");
+      return [null, ctx, {}, {}];
+    }
+    throw new Error(`SW fallback non migré pour ${name} (Phase 4 : HEVC + (E)AC3)`);
   }
   const ctx = await SW.createHEVCSession(codecpar);
   console.log("[sw-dec] libde265 : décodage logiciel HEVC activé (WASM)");

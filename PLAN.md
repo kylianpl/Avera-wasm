@@ -79,3 +79,24 @@ Sous-objectifs restants :
 - Tests parité vidéo : packets in → frames out vs ffmpeg (sample fiché
   `tests/fixtures/hevc-sample.mkv`, 640x360 x265 3s).
 - Validation navigateur (Chromium headless) : `?sw=` + HEVC → lecture fluide.
+
+### Audio (E)AC-3 — FAIT (tests 15/15 ✔)
+`ac3go` (AGPL-3.0) et `@mediabunny/ac3` (MPL-2.0 + couplage framework +
+worker dédié) refusés. Retenu : **build maison decode-only FFmpeg 8.1.2
+(`ac3` + `eac3`, LGPL-2.1-or-later, 579 Ko SINGLE_FILE, emcc 6.0.9)** —
+`packages/sw-decode/vendor/eac3/` (`bridge.c` + `BUILD.md` + `eac3.mjs`).
+`EAC3Session` (`src/eac3.js`) : PCM float entrelacé compatible
+`bufferAudioSamples` sans modif worker, `reset()` post-seek bit-exact
+(reprise à froid déterministe, prouvé par test), DRC désactivée.
+Branchée dans `compat.js` (`ff_init_decoder` 86019/86055). Validée
+navigateur (MKV h264+eac3 : 94/94 paquets décodés, seek propre).
+
+### Containers MP4 + MP3 — À FAIRE (décidé)
+- `packages/mp4-demux` (maison-JS) : moov (moov-first + moov-at-end via
+  range-reader) + **fMP4** (moof/traf), tables stts/ctts/stsc/stsz/stco/
+  co64/stss, paquets en ordre de décodage avec vrais pts/dts (B-frames),
+  extradata avcC/hvcC/esds/dac3/dec3 pour le bridge, seek via stss.
+- `packages/mp3-demux` : ID3v2 + sync frames + Xing/TOC, chemin UI
+  audio-only à vérifier.
+- Routeur de sniff dans `ff_init_demuxer_file` (EBML/ftyp/RIFF/ID3+sync),
+  même contrat paquets/streams. AVI reporté.
