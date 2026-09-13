@@ -215,7 +215,7 @@ class MediaWorker {
         await this.reInit(e.data);
         break;
       case "start":
-        this.startOutput();
+        await this.startOutput();
         this.updateMediaTime(e.data.pausedVideoTime, e.data.videoTimeStart);
         break;
       case "stop":
@@ -601,29 +601,41 @@ class MediaWorker {
 
   async primeAudioBuffer(serial, targetSeconds = 0.45) {
     if (this.audioStreamIndex === -1 || !this.ringbuffer) return;
-    const start = performance.now();
-    while (
-      serial === this.seekSerial &&
-      !this.fileEnded &&
-      this.audioBufferSeconds() < targetSeconds &&
-      performance.now() - start < 2000
-    ) {
-      await this.feedAudioDecoder();
-      if (this.audioBufferSeconds() >= targetSeconds) break;
-      await this.refillUntilPacketsAvailable(this.audioPacketQueue, serial, 250);
-      await new Promise((r) => setTimeout(r, 5));
+    // C'est le SEUL moment où on nourrit les décodeurs pendant un seek :
+    // le levier _priming le permet (sinon feed* jette tout en isSeeking).
+    this._priming = true;
+    try {
+      const start = performance.now();
+      while (
+        serial === this.seekSerial &&
+        !this.fileEnded &&
+        this.audioBufferSeconds() < targetSeconds &&
+        performance.now() - start < 2000
+      ) {
+        await this.feedAudioDecoder();
+        if (this.audioBufferSeconds() >= targetSeconds) break;
+        await this.refillUntilPacketsAvailable(this.audioPacketQueue, serial, 250);
+        await new Promise((r) => setTimeout(r, 5));
+      }
+    } finally {
+      this._priming = false;
     }
   }
 
   async showInitialFrame() {
     if (this.videoStreamIndex === -1) return;
     const serial = this.seekSerial;
-    await this.refillUntilPacketsAvailable(this.videoPacketQueue, serial, 1000);
-    await this.feedVideoDecoder();
-    const start = performance.now();
-    while (this.videoFrameBuffer.length === 0 && performance.now() - start < 1000) {
+    this._priming = true;
+    try {
+      await this.refillUntilPacketsAvailable(this.videoPacketQueue, serial, 1000);
       await this.feedVideoDecoder();
-      await new Promise((r) => setTimeout(r, 5));
+      const start = performance.now();
+      while (this.videoFrameBuffer.length === 0 && performance.now() - start < 1000) {
+        await this.feedVideoDecoder();
+        await new Promise((r) => setTimeout(r, 5));
+      }
+    } finally {
+      this._priming = false;
     }
     if (this.videoFrameBuffer.length > 0) {
       this.pausedVideoTime = this.videoFrameBuffer[0].timestamp / 1000;
@@ -1294,8 +1306,22 @@ class MediaWorker {
 
   // Communication with main thread
 
-  startOutput() {
+  async startOutput() {
     if (this.isPlaying) return;
+
+    // Lancement « rapide » (juste chargé, ou re-init) : pré-remplir l'anneau
+    // audio AVANT de démarrer l'horloge, sinon le worklet lit un anneau vide
+    // → silence + partial read pendant ~0,5s → le compteur avance sur du vide
+    // et la vidéo part en avance (petit décalage permanent).
+    if (
+      this.audioStreamIndex !== -1 &&
+      this.ringbuffer &&
+      this.audioBufferSeconds() < 0.3
+    ) {
+      const serial = this.seekSerial;
+      await this.primeAudioBuffer(serial, 0.45);
+      if (serial !== this.seekSerial) return; // seek arrivé pendant le prime
+    }
 
     this.isPlaying = true;
     // Use the first buffered frame's timestamp as the reference time,
@@ -1518,7 +1544,10 @@ class MediaWorker {
 
   async feedVideoDecoder() {
     // Video step 2/4: send the demuxed video packets to the video decoder
-    if (this.isSeeking) console.warn("feedVideoDecoder called while seeking");
+    if (this.isSeeking && !this._priming) {
+      console.warn("feedVideoDecoder called while seeking (jeté)");
+      return;
+    }
     if (this.videoFillInProgress) return;
     this.videoFillInProgress = true;
     await this.feedVideoDecoderInternal();
@@ -1598,7 +1627,7 @@ class MediaWorker {
 
   bufferVideoFrame(frame) {
     // Video step 3/4: add decoded video frame to the frame buffer
-    if (this.isSeeking)
+    if (this.isSeeking && !this._priming)
       console.warn(
         "bufferVideoFrame called while seeking (output of video decoder)",
       );
@@ -1698,7 +1727,10 @@ class MediaWorker {
 
   async feedAudioDecoder() {
     // Audio step 2/3: send the demuxed audio packets to the audio decoder
-    if (this.isSeeking) console.warn("feedAudioDecoder called while seeking");
+    if (this.isSeeking && !this._priming) {
+      console.warn("feedAudioDecoder called while seeking (jeté)");
+      return;
+    }
     if (this.audioFillInProgress) return;
     this.audioFillInProgress = true;
     try {
@@ -1834,7 +1866,7 @@ class MediaWorker {
     this._aOut = (this._aOut ?? 0) + 1;
 
     // based on https://github.com/w3c/webcodecs/blob/724b7d620519450c0c9630ab4eb97fe555f9007b/samples/lib/audio_renderer.js#L168
-    if (this.isSeeking)
+    if (this.isSeeking && !this._priming)
       console.warn(
         "bufferAudioSamples called while seeking (output of audio decoder)",
       );
