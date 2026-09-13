@@ -105,6 +105,19 @@ navigateur (MKV h264+eac3 : 94/94 paquets décodés, seek propre).
 - Validé navigateur : AVC/AAC (WebCodecs), HEVC+EAC3 (double SW),
   fMP4 — seeks delta 0, aucun warning.
 
-### Container MP3 — À FAIRE
-- `packages/mp3-demux` : ID3v2 + sync frames + Xing/TOC, chemin UI
-  audio-only à vérifier. AVI reporté.
+### Container MP3 — FAIT (tests 27/27 ✔)
+- `packages/mp3-demux` (maison-JS, 100% original) : ID3v2 (sauf
+  unsynchronisation) + APEv2 de tête toléré, frames MPEG Layer I/II/III
+  (MPEG 1/2/2.5), Xing/Info (durée exacte ; frame Info skippée comme
+  ffprobe), ID3v1 exclu, ouverture légère (tête seule).
+- Index de frames EXACT et dense, étendu paresseusement par fenêtres :
+  pts exacts après seek sans estimation (ni TOC ni proportionnel).
+  Lookahead anti faux-sync, free-format refusé, gapless LAME ignoré
+  (documenté, comme ffprobe : 1er pts = 0).
+- Routeur (sniff ID3/sync) + dispatch ; contrat inchangé. Audio-only
+  vérifié navigateur (overlay "No Video", horloge audio, seek OK).
+- Fixtures : mp3-cbr (ID3v2+Info), mp3-vbr (Xing+TOC) — 126 paquets
+  chacun, parité ffprobe exacte.
+- Bonus validé : `media/iceage-sample.mp4` réel (122s, 1280x694, AAC
+  5.1) — 2931v/5731a exacts, open 33ms, seek 60s en 0ms, navigateur
+  seek 61.2s delta -20ms @56fps. AVI reporté.
