@@ -10,6 +10,7 @@ import { dirname, join } from "node:path";
 import {
   createEAC3Session,
 } from "../packages/sw-decode/src/eac3.js";
+import { splitAc3Frames } from "../packages/sw-decode/src/ac3frames.js";
 import {
   ff_init_decoder,
   ff_decode_multi,
@@ -19,40 +20,6 @@ import {
 
 const root = join(dirname(fileURLToPath(import.meta.url)), "..");
 const FIX = (n) => join(root, "tests", "fixtures", n);
-
-// Tailles de frames AC-3 (mots de 16 bits) : [fscod 48k/44.1k/32k][frmsizecod].
-// ATSC A/52, table 5.18.
-const AC3_WORDS = [
-  [64,64,80,80,96,96,112,112,128,128,160,160,192,192,224,224,256,256,320,320,384,384,448,448,512,512,640,640,768,768,896,896,1024,1024,1152,1152,1280,1280],
-  [69,70,87,88,104,105,121,122,139,140,174,175,208,209,243,244,278,279,348,349,417,418,487,488,557,558,696,697,835,836,975,976,1114,1115,1253,1254,1393,1394],
-  [96,96,120,120,144,144,168,168,192,192,240,240,288,288,336,336,384,384,480,480,576,576,672,672,768,768,960,960,1152,1152,1344,1344,1536,1536],
-];
-
-/** Découpe un flux élémentaire (E)AC-3 en frames (sync 0x0B77). */
-export function splitAc3Frames(buf) {
-  const out = [];
-  let i = 0;
-  while (i + 6 < buf.length) {
-    if (buf[i] !== 0x0b || buf[i + 1] !== 0x77) { i++; continue; }
-    const bsid = buf[i + 5] >> 3;
-    let size = 0;
-    if (bsid === 16) {
-      // E-AC-3 (A/52B) : frmsiz sur 11 bits → (frmsiz+1) mots.
-      const frmsiz = ((buf[i + 2] & 0x07) << 8) | buf[i + 3];
-      size = (frmsiz + 1) * 2;
-    } else {
-      // AC-3 : fscod + frmsizecod → table.
-      const fscod = buf[i + 4] >> 6;
-      const frmsizecod = buf[i + 4] & 0x3f;
-      if (fscod > 2 || frmsizecod > 37) { i++; continue; }
-      size = AC3_WORDS[fscod][frmsizecod] * 2;
-    }
-    if (size < 8 || i + size > buf.length) break; // queue tronquée : on s'arrête
-    out.push(buf.subarray(i, i + size));
-    i += size;
-  }
-  return out;
-}
 
 /** Corrélation maximale (insensible à l'amplitude ET au retard encodeur/
  *  décodeur ~512 éch.) contre sin(2πft/sr), lag cherché sur ±2000 éch. */

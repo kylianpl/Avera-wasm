@@ -54,9 +54,9 @@ function mapCodec(codecId, kind) {
 }
 
 const CODEC_NAMES = {
-  27: "h264", 173: "hevc", 139: "vp8", 167: "vp9", 32797: "av1", 12: "mp4v",
-  30: "theora", 86017: "mp3", 86018: "aac", 86019: "ac3", 86055: "eac3",
-  86022: "opus", 86021: "vorbis", 86028: "flac", 94225: "subrip", 94226: "ass",
+  7: "mjpeg", 27: "h264", 173: "hevc", 139: "vp8", 167: "vp9", 32797: "av1", 12: "mp4v",
+  30: "theora", 86017: "mp3", 86016: "mp2", 86018: "aac", 86019: "ac3", 86055: "eac3",
+  86022: "opus", 86021: "vorbis", 86028: "flac", 65536: "pcm", 94225: "subrip", 94226: "ass",
 };
 export function avcodec_get_name(id) { return CODEC_NAMES[id] ?? `codec_${id}`; }
 export function ff_error(ret) {
@@ -203,7 +203,7 @@ export async function ff_init_demuxer_file(lib, name) {
     read: (off, len) => lib.read(name, off, len),
     getSize: async () => v.size,
   };
-  // Routeur de conteneur : EBML (MKV/WebM), ftyp (MP4/MOV/fMP4) ou MP3.
+  // Routeur de conteneur : EBML (MKV/WebM), ftyp (MP4/MOV/fMP4), MP3 ou AVI.
   const head = await source.read(0n, 16);
   if (sniffMp4(head)) {
     const opened = await openMp4(source);
@@ -248,6 +248,29 @@ export async function ff_init_demuxer_file(lib, name) {
       time_base_num: 1,
       time_base_den: 1000000000,
       metadata: {},
+    }));
+    return [session, streams];
+  }
+  if (sniffAvi(head)) {
+    const opened = await openAvi(source);
+    const session = {
+      kind: "avi",
+      lib, name, size: v.size, segOff: 0n, segEnd: v.size,
+      timecodeScale: 1000000n, durationNs: opened.durationNs,
+      tracks: opened.tracks, chapters: [],
+      cues: null, cuesScanned: true, seekEntries: [],
+      readPos: opened.avireadPos, firstClusterOff: opened.avireadPos,
+      eof: false, avi: { tracks: opened.tracks, hasIndex: opened.avi.hasIndex },
+    };
+    const streams = opened.tracks.map((t) => ({
+      index: t.index,
+      number: t.number,
+      codec_type: t.ffCodecType,
+      codec_id: t.ffCodecId,
+      codecpar: t,
+      time_base_num: 1,
+      time_base_den: 1000000000,
+      metadata: t.name ? { title: t.name } : {},
     }));
     return [session, streams];
   }
@@ -327,6 +350,8 @@ export async function ff_copyout_codecpar(track) {
     level: track.level ?? -1,
     audioProfile: track.audioProfile ?? -1,
     extradata: priv,
+    bitsPerSample: Number(track.bitsPerSample ?? 0),
+    isFloat: !!track.isFloat,
   };
 }
 
@@ -544,6 +569,12 @@ export async function ff_read_frame_multi(session, _packet, opts = {}) {
     if (r.eof) return Object.keys(r.byIdx).length ? [0, r.byIdx] : [AVERROR_EOF, r.byIdx];
     return [0, r.byIdx];
   }
+  if (session.kind === "avi") {
+    const r = await readAvi(session, session.lib, session.name, opts);
+    if (r.res < 0) return [r.res, r.byIdx];
+    if (r.eof) return Object.keys(r.byIdx).length ? [0, r.byIdx] : [AVERROR_EOF, r.byIdx];
+    return [0, r.byIdx];
+  }
   const limit = BigInt(opts.limit ?? 524288);
   const byIdx = {};
   if (session.eof) return [-541478725, byIdx];
@@ -699,6 +730,15 @@ async function seekNs(session, targetNs) {
       return -1;
     }
   }
+  if (session.kind === "avi") {
+    try {
+      await seekAvi(session, session.lib, session.name, targetNs);
+      session.eof = false;
+      return 0;
+    } catch {
+      return -1;
+    }
+  }
   try {
     const cues = await ensureCues(session);
     if (!cues.length) {
@@ -723,6 +763,7 @@ async function seekNs(session, targetNs) {
 import * as SW from "../../sw-decode/src/index.js";
 import { sniffMp4, openMp4, readMp4, seekMp4 } from "../../mp4-demux/src/index.js";
 import { sniffMp3, openMp3, readMp3, seekMp3 } from "../../mp3-demux/src/index.js";
+import { sniffAvi, openAvi, readAvi, seekAvi } from "../../avi-demux/src/index.js";
 
 export async function ff_init_decoder(codec_id, codecpar) {
   const name = avcodec_get_name(Number(codec_id));
@@ -732,7 +773,18 @@ export async function ff_init_decoder(codec_id, codecpar) {
       console.log("[sw-dec] décodeur logiciel audio activé (WASM FFmpeg)");
       return [null, ctx, {}, {}];
     }
-    throw new Error(`SW fallback non migré pour ${name} (Phase 4 : HEVC + (E)AC3)`);
+    if (name === "pcm") {
+      const cp = codecpar ?? {};
+      const ctx = await SW.createPCMSession({
+        channels: Number(cp.channels ?? cp.channelCount ?? 0),
+        sampleRate: Number(cp.sample_rate ?? cp.sampleRate ?? 0),
+        bits: Number(cp.bitsPerSample ?? 0),
+        isFloat: !!cp.isFloat,
+      });
+      console.log("[sw-dec] pont PCM logiciel activé");
+      return [null, ctx, {}, {}];
+    }
+    throw new Error(`SW fallback non migré pour ${name} (Phase 4 : HEVC + (E)AC3 + PCM)`);
   }
   const ctx = await SW.createHEVCSession(codecpar);
   console.log("[sw-dec] libde265 : décodage logiciel HEVC activé (WASM)");

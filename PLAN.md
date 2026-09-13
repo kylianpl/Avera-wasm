@@ -105,6 +105,32 @@ navigateur (MKV h264+eac3 : 94/94 paquets décodés, seek propre).
 - Validé navigateur : AVC/AAC (WebCodecs), HEVC+EAC3 (double SW),
   fMP4 — seeks delta 0, aucun warning.
 
+### Container AVI — FAIT (tests 34/34 ✔)
+- `packages/avi-demux` (maison-JS, 100% original) : RIFF unique (AVIX
+  refusé explicitement), hdrl (avih + strh/strf/strd/strn), movi
+  (descente récursive incl. 'rec ', chunks ##dc/##db/##wb, pads, chunks
+  vides sautés), idx1 (offsets vérifiés : base movi-type/payload/liste/
+  fichier), sans idx1 : balayage séquentiel (lecture OK, seek → reprise
+  à 0 documentée).
+- Vidéo : H264 Annex B → avcc (`annexbToAvcc` existant), avcC reconstruit
+  des SPS/PPS in-band (strd-avcC accepté), pts=dts=ordinal (pas de ctts
+  en AVI → fixtures -bf 0 ; B-frames non présentables, documenté).
+  Autres fourcc verbatim (XVID→mp4v parsé, décodage non migré).
+- Audio : MP3 découpé en frames, (E)AC-3 verbatim (1 chunk multi-frames
+  OK), PCM verbatim, AAC/ADTS découpé (+ASC strf ou synthétisé LC) ;
+  pts cumulés exacts (pas d'estimation), tags 0xFFFE/inconnus sniffés.
+- `sw-decode` : `ac3frames.js` (splitter déménagé des tests + numblks
+  E-AC-3 d'après ac3_parser.c FFmpeg), `pcm.js` (pont s8/s16/s24/s32/
+  f32/f64 → FLT, bit-exact), `ff_init_decoder` route pcm (65536).
+- Bug navigateur trouvé par l'AVI : `size: bytes` (objet partagé
+  data/size → buffer dupliqué dans la transfer list → postMessage qui
+  jette le batch) — corrigé + assertion buffers-uniques en test.
+- Validé navigateur : h264+mp3 (WebCodecs), h264+ac3 (SW), h264+pcm
+  (pont), seeks delta 0, zéro warning ; XVID : conteneur OK, refus
+  propre "non migré" (cohérent avec les autres codecs non supportés).
+- Limites v1 : OpenDML/AVIX, seek sans idx1, B-frames AVI, sous-titres
+  'tx', AAC-in-AVI non testé sur fixture réelle (code présent, ASC strf).
+
 ### Container MP3 — FAIT (tests 27/27 ✔)
 - `packages/mp3-demux` (maison-JS, 100% original) : ID3v2 (sauf
   unsynchronisation) + APEv2 de tête toléré, frames MPEG Layer I/II/III
