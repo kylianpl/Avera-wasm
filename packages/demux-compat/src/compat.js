@@ -1,7 +1,8 @@
 // packages/demux-compat/src/compat.js — interface "libav" pour app/worker.js,
 // adossée à packages/mkv-demux (JS prouvé) au lieu de libav.js.
 // Couvre D1–D10 (voir PLAN.md) : le worker ne change que ses imports.
-// SW fallback (ff_init_decoder/ff_decode_multi/…) : stubs Phase 4.
+// SW fallback : décodage logiciel WASM HEVC (libde265, cf. packages/sw-decode),
+// branché sur ff_init_decoder/ff_decode_multi (voir en bas de fichier).
 //
 // Conventions : timebase paquets = nanosecondes (num=1, den=1e9) — les maths
 // du worker (pts*num/den, streamTimestamp) tombent juste ; seek en ns.
@@ -317,10 +318,10 @@ _m.AVFormatContext_duration = function (s) { return AVFormatContext_duration(s);
 _m.AVFormatContext_metadata = function (s) { return AVFormatContext_metadata(s); };
 _m.av_packet_alloc = function () { return av_packet_alloc(); };
 _m.ff_error = function (r) { return ff_error(r); };
-_m.ff_init_decoder = function () { return ff_init_decoder(); };
-_m.ff_decode_multi = function () { return ff_decode_multi(); };
-_m.ff_free_decoder = function () { return ff_free_decoder(); };
-_m.avcodec_flush_buffers = function () { return avcodec_flush_buffers(); };
+_m.ff_init_decoder = function (...a) { return ff_init_decoder(...a); };
+_m.ff_decode_multi = function (...a) { return ff_decode_multi(...a); };
+_m.ff_free_decoder = function (...a) { return ff_free_decoder(...a); };
+_m.avcodec_flush_buffers = function (...a) { return avcodec_flush_buffers(...a); };
 
 // ---- D6 : curseur paquet (opaque, compat gère son curseur) ----
 export async function av_packet_alloc() { return {}; }
@@ -637,15 +638,41 @@ async function seekNs(session, targetNs) {
 
 // ---- D9/D10 déjà couverts (unlink, consts) ----
 
-// ---- SW fallback : stubs Phase 4 ----
-export async function ff_init_decoder() {
-  throw new Error("SW fallback libav : Phase 4 — non migré (WebCodecs uniquement pour l'instant)");
+// ---- SW fallback : Phase 4 (décodage logiciel WASM, libde265) ----
+// Remplace les stubs : HEVC → session libde265 (frames I420 format 0 que
+// libavFrameToVideoFrame sait rendre). Audio : non migré (WebCodecs suffit).
+import * as SW from "../../sw-decode/src/index.js";
+
+export async function ff_init_decoder(codec_id, codecpar) {
+  const name = avcodec_get_name(Number(codec_id));
+  if (name !== "hevc") {
+    throw new Error(`SW fallback non migré pour ${name} (Phase 4 : HEVC seulement)`);
+  }
+  const ctx = await SW.createHEVCSession(codecpar);
+  console.log("[sw-dec] libde265 : décodage logiciel HEVC activé (WASM)");
+  return [null, ctx, {}, {}];
 }
-export async function ff_decode_multi() {
-  throw new Error("SW fallback libav : Phase 4 — non migré (WebCodecs uniquement pour l'instant)");
+export async function ff_decode_multi(ctx, _packet, _frame, packets) {
+  if (!ctx?.decode) throw new Error("ff_decode_multi : contexte SW invalide");
+  const out = [];
+  for (const p of packets ?? []) {
+    if (!p?.data || !p.data.length) continue;
+    const ptsUs = p.pts == null || p.pts < 0
+      ? 0
+      : Math.round((Number(p.pts) * (p.time_base_num ?? 1)) / (p.time_base_den ?? 1e9) * 1e6);
+    const frames = ctx.decode(p.data, ptsUs);
+    for (const f of frames) out.push(f);
+  }
+  return out;
 }
-export async function ff_free_decoder() {}
-export async function avcodec_flush_buffers() {}
+export async function ff_free_decoder(ctx) {
+  ctx?.destroy?.();
+  return ctx ?? null;
+}
+export async function avcodec_flush_buffers(ctx) {
+  ctx?.reset?.();
+  return ctx ?? null;
+}
 export async function laFrameToVideoFrame() {
   throw new Error("SW fallback libav : Phase 4 — non migré (WebCodecs uniquement pour l'instant)");
 }

@@ -1,0 +1,36 @@
+{
+    "name": "@yume-chan/libde265",
+    "version": "1.0.0",
+    "description": "WebAssembly build of libde265 which is a open H.265 decoder.",
+    "keywords": [
+        "wasm",
+        "WebAssembly",
+        "H.265",
+        "H265",
+        "HEVC",
+        "Decoder",
+        "Decoding"
+    ],
+    "homepage": "https://github.com/yume-chan/libde265#README",
+    "bugs": {
+        "url": "https://github.com/yume-chan/libde265/issues"
+    },
+    "license":"LGPL-3.0"
+    "author": {
+        "name": "Simon Chan",
+        "url": "https://github.com/yume-chan"
+    },
+    "contributors": [
+        {
+            "name": "Joachim Bauch",
+            "url": "https://github.com/fancycode"
+        }
+    ],
+    "browser": "libde265.mjs",
+    "types": "libde265.d.ts",
+    "type": "module",
+    "repository": {
+        "type": "git",
+        "url": "https://github.com/yume-chan/libde265"
+    }
+}

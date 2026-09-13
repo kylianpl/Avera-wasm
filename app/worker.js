@@ -190,10 +190,10 @@ class MediaWorker {
       async ff_copyout_dict() { return {}; },
       async ff_get_demuxer_chapters() { return openCache.chapters; },
       async av_packet_alloc() { return {}; },
-      async ff_init_decoder() { return ff_init_decoder_raw(); },
-      async ff_decode_multi() { return ff_decode_multi_raw(); },
-      async ff_free_decoder() { return ff_free_decoder_raw(); },
-      async avcodec_flush_buffers() { return avcodec_flush_buffers_raw(); },
+      async ff_init_decoder(...a) { return ff_init_decoder_raw(...a); },
+      async ff_decode_multi(...a) { return ff_decode_multi_raw(...a); },
+      async ff_free_decoder(...a) { return ff_free_decoder_raw(...a); },
+      async avcodec_flush_buffers(...a) { return avcodec_flush_buffers_raw(...a); },
     };
   }
 

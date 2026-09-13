@@ -4,8 +4,8 @@ Base qui marche (validée beta) : shell AVera (worker monolithique + pump
 `queueMicrotask` + renderers WebGPU/GL2/GL/2d + sync horloge audio).
 Remplacement total de libavjs, en phases validables :
 
-## Phase 1A — démux JS prouvé + bridge fidèle (EN COURS)
-- `packages/mkv-demux/` : notre démux EBML/MKV (déjà validé byte-exact).
+## Phase 1A — démux JS prouvé + bridge fidèle ✅
+- `packages/mkv-demux/` : démux EBML/MKV JS (byte-exact, validé ffmpeg).
 - `packages/demux-compat/` : classe `Demux` exposant l'interface libav
   utilisée par `app/worker.js` (D1–D10 : init/range-reader/streams/packets/
   seek/chapters/duration/consts), adossée à notre démux. `worker.js`
@@ -17,21 +17,65 @@ Remplacement total de libavjs, en phases validables :
   description = extradata verbatim SSI `extradata[0]!==0`, `duration`
   toujours posée, pas de `hardwareAcceleration`, hex minuscule, Opus sans
   description, ASC brut pour AAC, timestamps pts-only µs arrondis.
-- SW fallback (ff_* decode) : stub erreur claire (Phase 4).
+- SW fallback (ff_* decode) : stubs → Phase 4.
 
-## Phase 1B — packet-reading Rust WASM
-- Étendre `mkv-demux-rs` (probe/tracks/chapters existent) : lecture
-  clusters/blocs + seek Cues + API wasm-bindgen miroir de demux-compat.
-- Swap sous la même interface (drop-in). Objectif : parité byte-exact
-  avec 1A (test : mêmes packets pour le sample Ice Age).
+## Phase 1B — packet-reading Rust WASM ✅
+- `crates/mkv-demux` étendu : clusters/blocs + lacing + BlockGroup +
+  Cues via SeekHead exact + API wasm-bindgen miroir de demux-compat.
+- Builds WASM : `packages/demux-wasm/web|nodejs/` (wasm-pack web+nodejs).
+- Parité byte-exact avec 1A (test : mêmes packets pour le sample Ice Age).
+- Swap sous la même interface (`?nowasm=1` force JS).
 
-## Phase 2 — validation beta (USER)
-Samples Ice Age/Kaguya via page beta : lecture fluide + console perf.
-Critère : parité AVera d'origine.
+## Phase 2 — validation beta ✅
+- Samples Ice Age (48kHz 5.1) / Kaguya (44.1kHz stéréo) via page beta :
+  lecture fluide, console perf, A/V synchro.
+- `?src=…` + serveur Range/206 + COOP/COEP.
+- Fix Firefox #2054811 (VA-API H264 paddé) : `?sw=1/0`, auto FF Linux <157.
 
-## Phase 3 — split des threads (APRÈS validation)
-Demuxer / decoder / renderer workers séparés (cf. README AVera :
-« splitting the monolithic Worker »).
+## Phase 3 — split des threads ✅
+- **Slice 1** (`render-worker.js`) : serveur de dessin. Reçoit VideoFrames
+  transférables, peint sur OffscreenCanvas via pickRenderer (WebGPU→WebGL2→
+  WebGL→Canvas2D), boucle rAF propre, fermeture propre.
+- **Slice 2** (`demux-worker.js`) : démux isolé, RPC (open/read/seek/close),
+  I/O HTTP Range sérialisée (mutex à chaîne de promesses), paquets
+  transférables. Generation pour invalider les réponses périmées.
+- **Decode worker** (`worker.js`) : décode WebCodecs + sync horloge audio
+  + file frames + pacing + décision présentation. Fencing `seekSerial`
+  (époque) + `_priming` (prime audio/video pendant seek/start).
+- Fixes validates : seeks rapides sans pause, switch audio, changement
+  de source cross-rate (48kHz↔44.1kHz), prime audio au démarrage.
 
-## Phase 4 — fallback SW via sw-decode WASM
-Brancher `crates/sw-decode` (H265/EAC3/…) comme fallback décodeur.
+## Phase 4 — fallback SW via sw-decode WASM (EN COURS)
+Brancher `packages/sw-decode` comme fallback décodeur logiciel pour les
+codecs non supportés par WebCodecs (H265/HEVC, EAC3, AC3, etc.).
+
+Objectif : quand `VideoDecoder.isConfigSupported` retourne `false`, le
+décodeur logiciel WASM prend le relais de manière transparente.
+
+### Vidéo HEVC/H.265 — FAIT (tests 9/9 ✔)
+Backend retenu après probe npm : **`@yume-chan/libde265`** (libde265 WASM,
+356 Ko, LGPL-3.0, ciblé decodeur pur — contrairement à `@hevcjs/core`
+orienté transcode/MSE et à ffmpeg.wasm, trop gros). `eac3` et
+`@flow-player/software-decoder-ffmpeg` non viables (deps git cassées).
+
+`packages/sw-decode/src/index.js` (wrapper original) :
+- Chargement du module via `instantiateWasm` injecté (pas de XHR → marche en
+  worker ET en Node pour les tests).
+- `packetNals` : détection Annex B / length-prefixed → NALs (réutilise
+  `mkv-demux/src/annexb.js`).
+- `extractHvcCParameterSets` : VPS/SPS/PPS hors-bande depuis le hvcC
+  (ffmpeg regroupe les paramètres du 1er bloc dans un faux "NAL" VPS
+  inutilisable → on les re-fournit explicitement, et après chaque `reset()`
+  car libde265 les vide au reset : indispensable pour la reprise post-seek).
+- `HEVCSession` : pushNal/AU + **réordonnancement de présentation** (libde265
+  sort les B-frames en ordre de décodage → fenêtre de finalisation par pts,
+  cohérent avec WebCodecs) ; frames I420 format 0 (10-bit → 8-bit via >>2).
+- Branché dans `compat.js` (`ff_init_decoder`/`ff_decode_multi`/
+  `ff_free_decoder`/`avcodec_flush_buffers`) : `worker.js` n'utilise que des
+  wrappers RPC inchangés (forward d'args ajouté).
+
+Sous-objectifs restants :
+- `setupFallbackAudioDecoder` (fallback audio EAC3/AC3) — non migré.
+- Tests parité vidéo : packets in → frames out vs ffmpeg (sample fiché
+  `tests/fixtures/hevc-sample.mkv`, 640x360 x265 3s).
+- Validation navigateur (Chromium headless) : `?sw=` + HEVC → lecture fluide.
