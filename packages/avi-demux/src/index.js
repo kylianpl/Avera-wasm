@@ -46,6 +46,18 @@ function aacProfile(asc) {
   if (aot === 29) return 28;
   return aot;
 }
+// Filler de délai d'encodeur ffmpeg en tête d'audio AVI ("Lavc63.1.101…" :
+// chunk 'dc 00 "Lavc…"', pas un frame décodable). Présent en AAC-in-AVI et
+// parfois ailleurs : 0 échantillon, à sauter (comme les chunks sans sync).
+function isLavcFiller(data) {
+  const n = Math.min(data.length, 32);
+  for (let i = 0; i + 4 <= n; i++) {
+    if (data[i] === 0x4c && data[i + 1] === 0x61 && data[i + 2] === 0x76 && data[i + 3] === 0x63) {
+      return true; // "Lavc"
+    }
+  }
+  return false;
+}
 // ASC LC minimal depuis un header ADTS (profil LC seulement).
 function ascFromAdts(data) {
   for (let i = 0; i + 7 <= data.length; i++) {
@@ -137,6 +149,9 @@ export async function openAvi(source) {
     if (t.ffCodecType === T_AUDIO && t.family === "unknown" && t.chunks.length) {
       await sniffAudioTrack(source, t);
     }
+    if (t.ffCodecType === T_AUDIO && t.family === "aac" && t.chunks.length) {
+      await initAacMode(source, t);
+    }
   }
   // Durée : vidéo (ordinal exact), sinon -1 (audio-only : strh peu fiable).
   let durationNs = -1n;
@@ -196,6 +211,7 @@ function buildTrack(s, index) {
     chunks: [], // {off,size,key}
     cursor: 0,
     cum: [0n], // audio : échantillon de départ du chunk i (BigInt)
+    _aacAdts: false, // AAC : true si chunks ADTS (headers à retirer), sinon RAW
     h264: null,
     bitsPerSample: 0,
     isFloat: false,
@@ -240,8 +256,19 @@ function buildTrack(s, index) {
       t.codecPrivate = Uint8Array.from(s.strf.ext);
       t.extradata = t.codecPrivate;
     }
-    if (t.family === "aac" && t.extradata.length) {
-      t.audioProfile = aacProfile(t.extradata);
+    if (t.family === "aac") {
+      // strf ext : cbSize compte 2o (WAVEFORMATEX) — l'ASC suit. Certains
+      // muxers y ajoutent du padding : on ne garde que l'ASC (2o LC).
+      let asc = t.extradata.length >= 2 ? t.extradata.subarray(0, 2) : t.extradata;
+      if (asc.length < 2 || (asc[0] >> 3) > 5) asc = new Uint8Array(0);
+      if (asc.length) {
+        t.codecPrivate = Uint8Array.from(asc);
+        t.extradata = t.codecPrivate;
+        t.audioProfile = aacProfile(asc);
+      } else {
+        t.codecPrivate = new Uint8Array(0);
+        t.extradata = t.codecPrivate;
+      }
     }
   }
   return t;
@@ -255,44 +282,100 @@ function gcd(a, b) {
 
 /** idx1 → listes de chunks (offsets vérifiés). Retourne true si index utilisable. */
 async function applyIdx1(source, idx1, movi, tracks) {
+  source._size = BigInt(await source.getSize());
   if (idx1.size > 256n * 1048576n || idx1.size < 16n) return false;
   const buf = await source.read(idx1.off, Number(idx1.size));
   if (buf.length < 16) return false;
   const n = Math.floor(buf.length / 16);
-  // Bases d'offsets rencontrées (ffmpeg : position du fourcc 'movi',
-  // soit listOff+8 ; variantes : payload, liste, fichier).
+  // Bases d'offsets : on compte les coups de chaque base sur TOUT l'idx1
+  // (chaque entrée vérifiée : id+taille sur place + chunk suivant valide) et
+  // on garde la MEILLEURE. La vérification par entrée seule est ambiguë
+  // (un mauvais offset tombe souvent sur un faux header plausible).
+  // Bases : 'movi'-type (listOff+8 — offsets relatifs au fourcc 'movi', le cas
+  // ffmpeg vérifié : idx1.off + listOff+8 tombe sur l'id + taille exacte),
+  // 'movi'-payload (listOff+12), liste, absolus fichier.
   const bases = [movi.listOff + 8n, movi.payloadOff, movi.listOff, 0n];
+  // Passe 1 : score chaque base. Critère STRICT : l'en-tête sur place
+  // (id du chunk + taille exacte) ET le chunk suivant (id de stream valide
+  // + taille bornée). Les chunks vides (sz 0) sont ignorés au score (leur
+  // "suivant" est ambigu : off+8 sans payload).
+  const scores = [0, 0, 0, 0];
+  const checkEntry = async (i, b) => {
+    const o = i * 16;
+    const off = (buf[o + 8] | (buf[o + 9] << 8) | (buf[o + 10] << 16)) + buf[o + 11] * 0x1000000;
+    const sz = (buf[o + 12] | (buf[o + 13] << 8) | (buf[o + 14] << 16)) + buf[o + 15] * 0x1000000;
+    if (sz === 0) return null; // vide : ne vote pas
+    const cand = b + BigInt(off);
+    if (cand + 16n > source._size) return false;
+    const hb = await source.read(cand, 16).catch(() => null);
+    if (!hb || hb.length < 16) return false;
+    if (hb[0] !== buf[o] || hb[1] !== buf[o + 1] || hb[2] !== buf[o + 2] || hb[3] !== buf[o + 3]) return false;
+    const s2 = (hb[4] | (hb[5] << 8) | (hb[6] << 16)) + hb[7] * 0x1000000;
+    if (s2 !== sz) return false;
+    const nb = await source.read(cand + 8n + BigInt(sz) + BigInt(sz & 1), 8).catch(() => null);
+    if (!nb || nb.length < 8) return false;
+    const nid = String.fromCharCode(nb[0], nb[1], nb[2], nb[3]);
+    if (streamIdxFromId(nid, tracks.length) < 0) return false;
+    const ns = (nb[4] | (nb[5] << 8) | (nb[6] << 16)) + nb[7] * 0x1000000;
+    return ns <= 256 * 1048576;
+  };
+  // Échantillonne (toutes si petit index, sinon ~64 entrées réparties).
+  const sampleIdx = [];
+  if (n <= 256) {
+    for (let i = 0; i < n; i++) sampleIdx.push(i);
+  } else {
+    for (let k = 0; k < 64; k++) sampleIdx.push(Math.floor((k * (n - 1)) / 63));
+  }
+  for (let bi = 0; bi < bases.length; bi++) {
+    for (const i of sampleIdx) {
+      try {
+        const r = await checkEntry(i, bases[bi]);
+        if (r) scores[bi]++;
+      } catch {}
+    }
+  }
+  let best = 0;
+  for (let bi = 1; bi < bases.length; bi++) {
+    if (scores[bi] > scores[best]) best = bi;
+  }
+  if (!scores[best]) return false;
+  // Passe 2 : applique la base gagnante. Chaque entrée non vide est
+  // vérifiée individuellement (id+taille sur place) : si elle échoue avec la
+  // base gagnante, on essaie les autres bases (fichiers mixtes / idx1 avec
+  // bases hétérogènes). Les vides sont gardés pour l'ordinal (tick de
+  // présentation, cf. ffprobe) mais n'émettront aucun paquet.
   const per = tracks.map(() => []);
-  let usable = 0;
+  const verifyAt = async (cand, o, sz) => {
+    const hb = await source.read(cand, 8).catch(() => null);
+    if (!hb || hb.length < 8) return false;
+    if (hb[0] !== buf[o] || hb[1] !== buf[o + 1] || hb[2] !== buf[o + 2] || hb[3] !== buf[o + 3]) return false;
+    const s2 = (hb[4] | (hb[5] << 8) | (hb[6] << 16)) + hb[7] * 0x1000000;
+    return s2 === sz;
+  };
   for (let i = 0; i < n; i++) {
     const o = i * 16;
     const id = String.fromCharCode(buf[o], buf[o + 1], buf[o + 2], buf[o + 3]);
     const flags = (buf[o + 4] | (buf[o + 5] << 8) | (buf[o + 6] << 16)) + buf[o + 7] * 0x1000000;
     const off = (buf[o + 8] | (buf[o + 9] << 8) | (buf[o + 10] << 16)) + buf[o + 11] * 0x1000000;
     const sz = (buf[o + 12] | (buf[o + 13] << 8) | (buf[o + 14] << 16)) + buf[o + 15] * 0x1000000;
-    if (sz === 0) {
-      // Chunk vide (padding d'encodeur, ex. ffmpeg) : gardé pour l'ordinal
-      // (il consomme un tick de présentation, cf. ffprobe : pts 0,80,120…),
-      // mais n'émettra aucun paquet.
-    }
     const si = streamIdxFromId(id, tracks.length);
     if (si < 0) continue;
-    // Vérifie la base : l'en-tête sur place doit correspondre (id + taille).
     let abs = null;
-    for (const b of bases) {
-      const cand = b + BigInt(off);
-      const hb = await source.read(cand, 8).catch(() => null);
-      if (hb && hb.length >= 8 &&
-          hb[0] === buf[o] && hb[1] === buf[o + 1] && hb[2] === buf[o + 2] && hb[3] === buf[o + 3]) {
-        const s2 = (hb[4] | (hb[5] << 8) | (hb[6] << 16)) + hb[7] * 0x1000000;
-        if (s2 === sz) { abs = cand; break; }
+    if (sz === 0) {
+      abs = bases[best] + BigInt(off); // vide : pas de payload à vérifier
+    } else {
+      for (let k = 0; k < bases.length; k++) {
+        const bi = (best + k) % bases.length; // gagnante d'abord
+        const cand = bases[bi] + BigInt(off);
+        try {
+          if (await verifyAt(cand, o, sz)) { abs = cand; break; }
+        } catch {}
       }
     }
     if (abs === null) continue;
     per[si].push({ off: abs + 8n, size: sz, key: !!(flags & 0x10), id });
-    usable++;
   }
-  if (!usable) return false;
+  if (!per.some((a) => a.length)) return false;
   for (let i = 0; i < tracks.length; i++) tracks[i].chunks = per[i];
   return true;
 }
@@ -391,6 +474,31 @@ async function sniffAudioTrack(source, t) {
       t.audioProfile = aacProfile(asc);
     }
   }
+  if (fam === "aac") t._aacAdts = true; // sniffé par sync ADTS → mode ADTS
+}
+
+/** AAC-in-AVI : ffmpeg multiplexe des frames RAW (1 chunk = 1 frame 1024
+ * échantillons, ASC dans strf), pas de l'ADTS. Certains muxers écrivent de
+ * l'ADTS : on tranche en testant la sync sur les premiers chunks non vides
+ * (le filler "Lavc" de tête ne doit pas faire voter : sync à 0 exigée). */
+async function initAacMode(source, t) {
+  let checked = 0;
+  for (const c of t.chunks) {
+    if (!c.size || checked >= 4) break;
+    let data;
+    try {
+      data = await source.read(c.off, Math.min(c.size, 16));
+    } catch {
+      break;
+    }
+    if (!data.length) continue;
+    checked++;
+    if (parseAdtsHeader(data, 0)) {
+      t._aacAdts = true;
+      return;
+    }
+  }
+  t._aacAdts = false;
 }
 
 /** Échantillons d'un chunk audio décodé (sans émission). */
@@ -414,18 +522,28 @@ function countChunkSamples(t, data) {
       return Math.floor(data.length / align);
     }
     case "aac": {
-      let n = 0;
-      for (const f of splitAdtsChunk(data)) n += f.samples;
-      return n;
+      if (t._aacAdts) {
+        let n = 0;
+        for (const f of splitAdtsChunk(data)) n += f.samples;
+        return n;
+      }
+      // RAW (cas ffmpeg) : 1 chunk = 1 frame = 1024 échantillons, sauf filler.
+      if (isLavcFiller(data)) return 0;
+      return data.length ? 1024 : 0;
     }
     default:
       return 0;
   }
 }
 
-/** Étend cum[] (échantillons cumulés par chunk) jusqu'à couvrir `unit`. */
+/** Étend cum[] (échantillons cumulés par chunk) jusqu'à couvrir `unit`.
+ * cum[i] = échantillon de départ du chunk i ; cum[0] = 0. L'émission
+ * (packetsForChunk) pose cum[cursor+1] à chaque chunk émis, donc en lecture
+ * séquentielle les bases existent toujours. Seul un seek peut sauter par
+ * dessus des chunks non mesurés : extendCum les mesure alors en relisant
+ * leurs données (cache 1MiB : borné et paresseux). */
 async function extendCum(lib, name, t, unit) {
-  while (t.cum.length <= t.chunks.length) {
+  for (;;) {
     const i = t.cum.length - 1; // chunk à mesurer
     if (i >= t.chunks.length) break;
     if (t.cum[i] >= unit && i > 0) break;
@@ -437,8 +555,8 @@ async function extendCum(lib, name, t, unit) {
       break;
     }
     if (!data || data.length < c.size) break;
-    t.cum.push(t.cum[i] + BigInt(countChunkSamples(t, data)));
-    if (t.cum[t.cum.length - 1] >= unit) break;
+    t.cum[i + 1] = t.cum[i] + BigInt(countChunkSamples(t, data));
+    if (t.cum[i + 1] >= unit) break;
   }
 }
 
@@ -464,6 +582,13 @@ export async function readAvi(session, lib, name, opts = {}) {
     const c = t.chunks[t.cursor];
     if (c.size === 0) {
       // Chunk vide (padding) : consomme l'ordinal, n'émet rien.
+      // cum[cursor+1] est posé par packetsForChunk après émission ; ici
+      // aucun paquet ne sort, on propage la base (index dense cohérent).
+      // NOTE : ne JAMAIS mettre continue AVANT d'avoir vérifié que la
+      // boucle progresse (voir garde-fou ci-dessous).
+      if (t.ffCodecType === T_AUDIO && t.cum[t.cursor + 1] === undefined) {
+        t.cum[t.cursor + 1] = t.cum[t.cursor] ?? 0n;
+      }
       t.cursor++;
       session.readPos = c.off;
       continue;
@@ -512,22 +637,29 @@ function packetsForChunk(t, c, data, hasIndex) {
     }];
   }
   // Audio : découpe + pts cumulés.
+  // NOTE (transfert inter-workers) : chaque paquet doit POSSEDER son buffer
+  // (pas de subarray partagé) — voir demux-worker collectTransfer. Les
+  // découpes (MP3/ADTS/(E)AC-3) sont donc copiées.
+  // Si le chunk ne donne aucun échantillon (filler "Lavc" ffmpeg en tête
+  // d'AAC-in-AVI, junk), on n'émet rien MAIS on pose cum[cursor+1] = base
+  // (cohérence de l'index dense).
   const sr = t.timescale || t.sampleRate || 1;
   const base = t.cum[t.cursor] ?? 0n;
+  let acc = 0;
   const out = [];
   const pushPcm = (samples, bytes) => {
     out.push({
-      pts: nsSamp(base + BigInt(out._s ?? 0), sr),
-      dts: nsSamp(base + BigInt(out._s ?? 0), sr),
+      pts: nsSamp(base + BigInt(acc), sr),
+      dts: nsSamp(base + BigInt(acc), sr),
       size: bytes.length, data: bytes,
       time_base_num: 1, time_base_den: 1000000000,
       duration: nsSamp(BigInt(samples), sr), key: true,
     });
-    out._s = (out._s ?? 0) + samples;
+    acc += samples;
   };
   if (t.family === "mp3") {
     for (const f of splitMp3Chunk(data)) {
-      pushPcm(f.spf, data.slice(f.off, f.off + f.len));
+      pushPcm(f.spf, Uint8Array.from(data.subarray(f.off, f.off + f.len)));
     }
   } else if (t.family === "ac3" || t.family === "eac3") {
     const frames = splitAc3Frames(data);
@@ -545,17 +677,26 @@ function packetsForChunk(t, c, data, hasIndex) {
     const n = align > 0 ? Math.floor(data.length / align) : 0;
     if (n > 0) pushPcm(n, data);
   } else if (t.family === "aac") {
-    for (const f of splitAdtsChunk(data)) {
-      pushPcm(f.samples, data.slice(f.off, f.off + f.len));
+    if (t._aacAdts) {
+      // WebCodecs AAC veut du RAW (sans en-têtes ADTS) : on les retire.
+      // Le 1er chunk ffmpeg ("Lavc…", filler de délai) n'a pas de sync :
+      // 0 paquet, cum inchangé (l'audio démarre au 1er vrai ADTS).
+      for (const f of splitAdtsChunk(data)) {
+        pushPcm(f.samples, Uint8Array.from(data.subarray(f.off + f.hdr, f.off + f.len)));
+      }
+    } else if (!isLavcFiller(data)) {
+      // RAW ffmpeg : 1 chunk = 1 frame AAC (1024 échantillons), tel quel.
+      // `data` est déjà un buffer propre à ce chunk (lib.read).
+      pushPcm(1024, data);
     }
+    // Filler "Lavc" : 0 paquet, cum inchangé (cf. commentaire d'en-tête).
   } else {
     // Audio inconnu : paquet brut (le décodeur échouera proprement).
     pushPcm(0, data);
   }
-  const total = out._s ?? 0;
-  delete out._s;
-  // cum[i+1] : borne de fin du chunk i (cohérent avec extendCum).
-  t.cum[t.cursor + 1] = base + BigInt(total);
+  // cum[cursor+1] : borne de fin du chunk (l'émission mesure en même temps :
+  // pas de double lecture, et le comptage vaut pour les paquets émis).
+  t.cum[t.cursor + 1] = base + BigInt(acc);
   return out;
 }
 

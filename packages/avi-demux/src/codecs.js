@@ -128,8 +128,10 @@ const ADTS_RATES = [96000, 88200, 64000, 48000, 44100, 32000, 24000, 22050, 1600
 /** En-tête ADTS à `pos` → { frameLen, samples } ou null. */
 export function parseAdtsHeader(buf, pos) {
   if (pos + 7 > buf.length) return null;
-  if (buf[pos] !== 0xff || (buf[pos + 1] & 0xf0) !== 0xf0) return null;
-  if ((buf[pos + 1] & 0x06) !== 0) return null; // layer doit être 0
+  // Sync ADTS : 0xFFF (12 bits). Le layer (2 bits) DOIT être 0 mais certains
+  // muxers (ffmpeg/Lavc en AVI) écrivent des valeurs non nulles : on ne le
+  // teste pas (taille + fréquence + progression suffisent, cf. MP3).
+  if (buf[pos] !== 0xff || (buf[pos + 1] & 0xf0) !== 0xf0) return null; // sync
   const freqIdx = (buf[pos + 2] >> 2) & 0x0f;
   if (freqIdx === 15 || ADTS_RATES[freqIdx] === undefined) return null;
   const protection = buf[pos + 1] & 0x01;
@@ -137,7 +139,7 @@ export function parseAdtsHeader(buf, pos) {
   const frameLen = ((buf[pos + 3] & 0x03) << 11) | (buf[pos + 4] << 3) | ((buf[pos + 5] >> 5) & 0x07);
   if (frameLen < hdrLen || frameLen > 8192) return null;
   const blocks = buf[pos + 6] & 0x03;
-  return { frameLen, samples: (blocks + 1) * 1024 };
+  return { frameLen, hdr: hdrLen, samples: (blocks + 1) * 1024 };
 }
 
 /** Découpe un chunk AAC/ADTS en frames [{off,len,samples}]. */

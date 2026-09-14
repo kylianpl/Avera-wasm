@@ -4,7 +4,8 @@
 //   avi-h264-ac3.avi : H264 + AC-3 (1 chunk à 2 frames → découpage)
 //   avi-h264-pcm.avi : H264 + PCM s16le (pont logiciel, corrélation = 1)
 //   avi-xvid-mp3.avi : MPEG-4 ASP + MP3 (conteneur OK, décodage non migré)
-// Comptes ffprobe : v75 + a126/a94/a141/a126.
+//   avi-h264-aac.avi : H264 + AAC RAW (1 chunk = 1 frame, filler "Lavc" skippé)
+// Comptes ffprobe : v75 + a126/a94/a141/a126/a141(+1 filler).
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
@@ -203,6 +204,35 @@ describe("avi-demux", () => {
     } finally {
       await ff_free_decoder(ctx);
     }
+  });
+
+  it("aac → 75v+141a RAW, ASC 1190, pts cumulés 1024 éch/frame", async () => {
+    const { session, streams } = await openFile(FIX("avi-h264-aac.avi"));
+    const vIdx = streams.find((s) => s.codec_type === AVMEDIA_TYPE_VIDEO).index;
+    const aIdx = streams.find((s) => s.codec_type === AVMEDIA_TYPE_AUDIO).index;
+    const a = streams[aIdx];
+    assert.equal(avcodec_get_name(a.codec_id), "aac");
+    const ca = await ff_copyout_codecpar(a.codecpar);
+    assert.equal(ca.sample_rate, 48000);
+    assert.equal(ca.channels, 2);
+    // ASC LC 48kHz stéréo (strf ext rognée du padding : 11 90).
+    assert.equal(Buffer.from(ca.extradata).toString("hex"), "1190");
+    const { v, a: ap } = await readAll(session, vIdx, aIdx);
+    assert.equal(v.length, 75);
+    // ffprobe compte 142 paquets audio dont le filler "Lavc" de tête (pos
+    // 9998, 286o, non décodable) : on l'émet pas, cum inchangé → 141 paquets.
+    assert.equal(ap.length, 141);
+    assert.equal(ap[0].pts, 0);
+    assert.equal(ap[0].size, 363); // 1er vrai frame (pos 18200 ffprobe)
+    assert.equal(ap[0].data[0], 0x21);
+    for (const p of ap) {
+      assert.equal(p.duration, 21333333); // 1024 éch @48kHz, arrondi ns
+      assert.equal(p.size, p.data.length);
+    }
+    for (let i = 1; i < ap.length; i++) assert.ok(ap[i].pts > ap[i - 1].pts, "pts audio croissants");
+    assert.equal(ap[ap.length - 1].pts + ap[ap.length - 1].duration, 3007999999);
+    const [res] = await ff_read_frame_multi(session, {}, { limit: 262144 });
+    assert.equal(res, AVERROR_EOF);
   });
 
   it("sans idx1 → lecture complète, seek dégradé à 0", async () => {
