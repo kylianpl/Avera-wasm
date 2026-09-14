@@ -1,0 +1,6 @@
+{
+  "name": "@mpv-web/ogg-demux",
+  "version": "0.1.0",
+  "type": "module",
+  "main": "./src/index.js"
+}
