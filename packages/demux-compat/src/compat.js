@@ -204,8 +204,31 @@ export async function ff_init_demuxer_file(lib, name) {
     read: (off, len) => lib.read(name, off, len),
     getSize: async () => v.size,
   };
-  // Routeur de conteneur : OggS, EBML (MKV/WebM), ftyp (MP4/MOV/fMP4), MP3 ou AVI.
+  // Routeur de conteneur : OggS, WAV, EBML (MKV/WebM), ftyp (MP4/MOV/fMP4), MP3 ou AVI.
   const head = await source.read(0n, 16);
+  if (sniffWav(head)) {
+    const opened = await openWav(source);
+    const session = {
+      kind: "wav",
+      lib, name, size: v.size, segOff: 0n, segEnd: v.size,
+      timecodeScale: 1000000n, durationNs: opened.durationNs,
+      tracks: opened.tracks, chapters: [],
+      cues: null, cuesScanned: true, seekEntries: [],
+      readPos: opened.wavreadPos, firstClusterOff: opened.wavreadPos,
+      eof: false, wav: opened.wav,
+    };
+    const streams = opened.tracks.map((t) => ({
+      index: t.index,
+      number: t.number,
+      codec_type: t.ffCodecType,
+      codec_id: t.ffCodecId,
+      codecpar: t,
+      time_base_num: 1,
+      time_base_den: 1000000000,
+      metadata: t.name ? { title: t.name } : {},
+    }));
+    return [session, streams];
+  }
   if (sniffOgg(head)) {
     const opened = await openOgg(source);
     const session = {
@@ -612,6 +635,12 @@ export async function ff_read_frame_multi(session, _packet, opts = {}) {
     if (r.eof) return Object.keys(r.byIdx).length ? [0, r.byIdx] : [AVERROR_EOF, r.byIdx];
     return [0, r.byIdx];
   }
+  if (session.kind === "wav") {
+    const r = await readWav(session, session.lib, session.name, opts);
+    if (r.res < 0) return [r.res, r.byIdx];
+    if (r.eof) return Object.keys(r.byIdx).length ? [0, r.byIdx] : [AVERROR_EOF, r.byIdx];
+    return [0, r.byIdx];
+  }
   const limit = BigInt(opts.limit ?? 524288);
   const byIdx = {};
   if (session.eof) return [-541478725, byIdx];
@@ -790,6 +819,15 @@ async function seekNs(session, targetNs) {
       return -1;
     }
   }
+  if (session.kind === "wav") {
+    try {
+      await seekWav(session, session.lib, session.name, targetNs);
+      session.eof = false;
+      return 0;
+    } catch {
+      return -1;
+    }
+  }
   try {
     const cues = await ensureCues(session);
     if (!cues.length) {
@@ -816,6 +854,7 @@ import { sniffMp4, openMp4, readMp4, seekMp4 } from "../../mp4-demux/src/index.j
 import { sniffMp3, openMp3, readMp3, seekMp3 } from "../../mp3-demux/src/index.js";
 import { sniffAvi, openAvi, readAvi, seekAvi } from "../../avi-demux/src/index.js";
 import { sniffOgg, openOgg, readOgg, seekOgg } from "../../ogg-demux/src/index.js";
+import { sniffWav, openWav, readWav, seekWav } from "../../wav-demux/src/index.js";
 
 export async function ff_init_decoder(codec_id, codecpar) {
   const name = avcodec_get_name(Number(codec_id));
