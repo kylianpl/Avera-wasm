@@ -129,6 +129,10 @@ export function audioStreamToConfig(t) {
     ret.codec = "opus";
   } else if (t.family === "mp3") {
     ret.codec = "mp3";
+  } else if (t.family === "mp2") {
+    // MP1/MP2 (TS broadcast, DVD) : nourri au décodeur "mp3" (FFmpeg
+    // mp3float sous-jacent : les 3 layers ; validé en navigateur TS).
+    ret.codec = "mp3";
   } else if (t.family === "vorbis") {
     ret.codec = "vorbis";
     if (e && e.length) ret.description = e;

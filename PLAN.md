@@ -172,3 +172,29 @@ MJPEG jouables (MKV VFW et MP4-mp4v inclus gratis).
 - Bonus validé : `media/iceage-sample.mp4` réel (122s, 1280x694, AAC
   5.1) — 2931v/5731a exacts, open 33ms, seek 60s en 0ms, navigateur
   seek 61.2s delta -20ms @56fps. AVI reporté.
+
+### Container MPEG-TS — FAIT (suite 70/70 ✔, dont 7 TS)
+- `packages/ts-demux` (maison-JS, 100% original) : stride 188/192o
+  (m2ts TP_extra_header, sync à +4), PAT/PMT (CRC32, sections
+  réassemblées), PES réassemblés par PID, PTS/DTS 90kHz, PCR (durée),
+  t0 normalisé sur le min (offset A/V préservé).
+- Vidéo : H264/HEVC Annex B → avcc + avcC/hvcC in-band (SPS parsés :
+  dims/profil/niveau ; header NAL sauté), clés IDR/IRAP (+rai) ;
+  découpe en AUs sur AUD (par famille : le SEI H264 0x46 ressemble au
+  AUD HEVC ; les start codes 4o se détectent 2× sans garde) ; MPEG-2
+  passthrough (séquence→dims/fps, 1 paquet/image, clé=séquence).
+- Audio : AAC-ADTS→RAW (+ASC), AC-3 (têtes bit-exactes jusqu'à lfeon) /
+  E-AC-3 / MP3 / MP2 (layer réel : ffmpeg signale MP2 en type 0x03) /
+  DTS (core BE) découpés, pts cumulés intra-PES ; 0x06 nu (AAC en m2ts
+  ffmpeg) sniffé au 1er PES (pattern avi-demux), 0x84→eac3.
+- Transfert : chaque paquet possède son buffer (frames AC-3 copiées —
+  même bug qu'en AVI, assertion buffers-uniques en test).
+- Seek : fraction bitrate + backtrack 2Mo (l'estimation peut tomber dans
+  le PES clé cible) + avance à la clé PTS≥cible (approximatif, sans
+  index) ; durée inconnue → reprise à 0. MPEG-2/DTS : démux OK, SW
+  decode étape 6 (échec propre `non migré` asserté).
+- Validé navigateur : h264+aac (188/192o), hevc (SW libde265), ac3/eac3
+  (SW), seeks delta 0, zéro erreur transfert.
+- Fixtures : ts-h264-aac/ac3/eac3 (75v+94/142a), ts-hevc-aac (75v+142a,
+  IRAP), ts-mpeg2-mp2 (75v+125a, GOP 12), ts-h264-aac.m2ts (75v+142a) —
+  parité ffprobe exacte.

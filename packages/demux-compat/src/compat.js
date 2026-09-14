@@ -34,11 +34,14 @@ function mapCodec(codecId, kind) {
   if (c.startsWith("V_VP9")) return V("vp9", 167);
   if (c.startsWith("V_AV1")) return V("av1", 32797);
   if (c.startsWith("V_MPEG4/ISO/ASP") || c.startsWith("V_MS/VFW/FOURCC")) return V("mp4v", 12);
+  if (c.startsWith("V_MPEG2") || c.startsWith("V_MPEG1")) return V("mpeg2video", 2);
   if (c.startsWith("V_THEORA")) return V("theora", 30);
   if (c.startsWith("A_MPEG/L3")) return A("mp3", 86017);
+  if (c.startsWith("A_MPEG/L1") || c.startsWith("A_MPEG/L2")) return A("mp2", 86016);
   if (c.startsWith("A_AAC")) return A("aac", 86018);
   if (c.startsWith("A_AC3")) return A("ac3", 86019);
   if (c.startsWith("A_EAC3")) return A("eac3", 86055);
+  if (c.startsWith("A_DTS")) return A("dts", 86056);
   if (c.startsWith("A_OPUS")) return A("opus", 86022);
   if (c.startsWith("A_VORBIS")) return A("vorbis", 86021);
   if (c.startsWith("A_FLAC")) return A("flac", 86028);
@@ -54,9 +57,11 @@ function mapCodec(codecId, kind) {
 }
 
 const CODEC_NAMES = {
+  2: "mpeg2video",
   7: "mjpeg", 4: "h263", 14: "msmpeg4v1", 15: "msmpeg4v2", 16: "msmpeg4v3",
   27: "h264", 173: "hevc", 139: "vp8", 167: "vp9", 32797: "av1", 12: "mp4v",
   30: "theora", 86017: "mp3", 86016: "mp2", 86018: "aac", 86019: "ac3", 86055: "eac3",
+  86056: "dts",
   86022: "opus", 86021: "vorbis", 86028: "flac", 65536: "pcm", 94225: "subrip", 94226: "ass",
 };
 export function avcodec_get_name(id) { return CODEC_NAMES[id] ?? `codec_${id}`; }
@@ -204,8 +209,38 @@ export async function ff_init_demuxer_file(lib, name) {
     read: (off, len) => lib.read(name, off, len),
     getSize: async () => v.size,
   };
-  // Routeur de conteneur : OggS, WAV, EBML (MKV/WebM), ftyp (MP4/MOV/fMP4), MP3 ou AVI.
+  // Routeur de conteneur : OggS, WAV, TS, EBML (MKV/WebM), ftyp (MP4/MOV/fMP4), MP3 ou AVI.
   const head = await source.read(0n, 16);
+  if (head.length >= 1 && (head[0] === 0x47 || (head.length > 4 && head[4] === 0x47))) {
+    // TS/m2ts : stride 188/192 exige ~400o pour triple-sync — vérifie avant MP3/EBML.
+    try {
+      const h512 = await source.read(0n, 512);
+      if (sniffTs(h512)) {
+        const opened = await openTs(source);
+        const session = {
+          kind: "ts",
+          lib, name, size: v.size, segOff: 0n, segEnd: v.size,
+          timecodeScale: 1000000n, durationNs: opened.durationNs,
+          tracks: opened.tracks, chapters: [],
+          cues: null, cuesScanned: true, seekEntries: [],
+          readPos: opened.tsreadPos, firstClusterOff: opened.tsreadPos,
+          eof: false, ts: opened.ts,
+          tsreadPos: opened.tsreadPos, fileSize: v.size,
+        };
+        const streams = opened.tracks.map((t) => ({
+          index: t.index,
+          number: t.number,
+          codec_type: t.ffCodecType,
+          codec_id: t.ffCodecId,
+          codecpar: t,
+          time_base_num: 1,
+          time_base_den: 1000000000,
+          metadata: t.name ? { title: t.name } : {},
+        }));
+        return [session, streams];
+      }
+    } catch {}
+  }
   if (sniffWav(head)) {
     const opened = await openWav(source);
     const session = {
@@ -641,6 +676,12 @@ export async function ff_read_frame_multi(session, _packet, opts = {}) {
     if (r.eof) return Object.keys(r.byIdx).length ? [0, r.byIdx] : [AVERROR_EOF, r.byIdx];
     return [0, r.byIdx];
   }
+  if (session.kind === "ts") {
+    const r = await readTs(session, session.lib, session.name, opts);
+    if (r.res < 0) return [r.res, r.byIdx];
+    if (r.eof) return Object.keys(r.byIdx).length ? [0, r.byIdx] : [AVERROR_EOF, r.byIdx];
+    return [0, r.byIdx];
+  }
   const limit = BigInt(opts.limit ?? 524288);
   const byIdx = {};
   if (session.eof) return [-541478725, byIdx];
@@ -828,6 +869,15 @@ async function seekNs(session, targetNs) {
       return -1;
     }
   }
+  if (session.kind === "ts") {
+    try {
+      await seekTs(session, session.lib, session.name, targetNs);
+      session.eof = false;
+      return 0;
+    } catch {
+      return -1;
+    }
+  }
   try {
     const cues = await ensureCues(session);
     if (!cues.length) {
@@ -855,6 +905,7 @@ import { sniffMp3, openMp3, readMp3, seekMp3 } from "../../mp3-demux/src/index.j
 import { sniffAvi, openAvi, readAvi, seekAvi } from "../../avi-demux/src/index.js";
 import { sniffOgg, openOgg, readOgg, seekOgg } from "../../ogg-demux/src/index.js";
 import { sniffWav, openWav, readWav, seekWav } from "../../wav-demux/src/index.js";
+import { sniffTs, openTs, readTs, seekTs } from "../../ts-demux/src/index.js";
 
 export async function ff_init_decoder(codec_id, codecpar) {
   const name = avcodec_get_name(Number(codec_id));
