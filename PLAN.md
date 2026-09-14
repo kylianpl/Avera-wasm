@@ -198,3 +198,20 @@ MJPEG jouables (MKV VFW et MP4-mp4v inclus gratis).
 - Fixtures : ts-h264-aac/ac3/eac3 (75v+94/142a), ts-hevc-aac (75v+142a,
   IRAP), ts-mpeg2-mp2 (75v+125a, GOP 12), ts-h264-aac.m2ts (75v+142a) —
   parité ffprobe exacte.
+
+### FLAC natif — FAIT (suite 75/75 ✔, dont 5 FLAC)
+- `packages/flac-demux` (maison-JS, 100% original, miroir mp3-demux) :
+  "fLaC" (+ ID3v2-préfixé tranché au routeur avant MP3), STREAMINFO en
+  1er (requis), autres blocs sautés. Index de frames EXACT et dense,
+  étendu paresseusement (fenêtres 1MiB : sync + CRC8 + continuité des
+  n° frame/sample selon stratégie — même motif que mp3-demux) : pts
+  exacts au sample après seek, sans estimation.
+- Durée = total STREAMINFO (repli -1 si 0) ; dernière frame rognée au
+  total (padding, motif gapless). WebCodecs direct (pas de SW) : blob
+  "fLaC"+STREAMINFO 42o — flag "last" (0x10) PROSCRIT, Chromium rejette
+  la description sinon ("Unsupported configuration", trouvé + vérifié
+  en navigateur minimal, assertion en test).
+- Fixtures : flac-mono/flac-stereo (141 paquets, 140×1024+640) — parité
+  ffprobe exacte, seeks exacts + continuité, buffers uniques.
+- Validé navigateur : mono + stéréo jouent (horloge audio, seek delta 0,
+  zéro erreur).

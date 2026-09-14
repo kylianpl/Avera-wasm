@@ -209,8 +209,42 @@ export async function ff_init_demuxer_file(lib, name) {
     read: (off, len) => lib.read(name, off, len),
     getSize: async () => v.size,
   };
-  // Routeur de conteneur : OggS, WAV, TS, EBML (MKV/WebM), ftyp (MP4/MOV/fMP4), MP3 ou AVI.
+  // Routeur de conteneur : FLAC, OggS, WAV, TS, EBML (MKV/WebM), ftyp (MP4/MOV/fMP4), MP3 ou AVI.
   const head = await source.read(0n, 16);
+  let isFlac = sniffFlac(head);
+  if (!isFlac && head.length >= 10 && head[0] === 0x49 && head[1] === 0x44 && head[2] === 0x33) {
+    // .flac taggé ID3v2 (rare) : fLaC après le tag (avant la branche MP3).
+    const tag = flacId3Size(head);
+    if (tag > 0) {
+      try {
+        const m = await source.read(BigInt(tag), 4);
+        isFlac = m.length === 4 && m[0] === 0x66 && m[1] === 0x4c && m[2] === 0x61 && m[3] === 0x43;
+      } catch {}
+    }
+  }
+  if (isFlac) {
+    const opened = await openFlac(source);
+    const session = {
+      kind: "flac",
+      lib, name, size: v.size, segOff: 0n, segEnd: v.size,
+      timecodeScale: 1000000n, durationNs: opened.durationNs,
+      tracks: opened.tracks, chapters: [],
+      cues: null, cuesScanned: true, seekEntries: [],
+      readPos: opened.flacreadPos, firstClusterOff: opened.flacreadPos,
+      eof: false, flac: opened.flac,
+    };
+    const streams = opened.tracks.map((t) => ({
+      index: t.index,
+      number: t.number,
+      codec_type: t.ffCodecType,
+      codec_id: t.ffCodecId,
+      codecpar: t,
+      time_base_num: 1,
+      time_base_den: 1000000000,
+      metadata: t.name ? { title: t.name } : {},
+    }));
+    return [session, streams];
+  }
   if (head.length >= 1 && (head[0] === 0x47 || (head.length > 4 && head[4] === 0x47))) {
     // TS/m2ts : stride 188/192 exige ~400o pour triple-sync — vérifie avant MP3/EBML.
     try {
@@ -682,6 +716,12 @@ export async function ff_read_frame_multi(session, _packet, opts = {}) {
     if (r.eof) return Object.keys(r.byIdx).length ? [0, r.byIdx] : [AVERROR_EOF, r.byIdx];
     return [0, r.byIdx];
   }
+  if (session.kind === "flac") {
+    const r = await readFlac(session, session.lib, session.name, opts);
+    if (r.res < 0) return [r.res, r.byIdx];
+    if (r.eof) return Object.keys(r.byIdx).length ? [0, r.byIdx] : [AVERROR_EOF, r.byIdx];
+    return [0, r.byIdx];
+  }
   const limit = BigInt(opts.limit ?? 524288);
   const byIdx = {};
   if (session.eof) return [-541478725, byIdx];
@@ -878,6 +918,15 @@ async function seekNs(session, targetNs) {
       return -1;
     }
   }
+  if (session.kind === "flac") {
+    try {
+      await seekFlac(session, session.lib, session.name, targetNs);
+      session.eof = false;
+      return 0;
+    } catch {
+      return -1;
+    }
+  }
   try {
     const cues = await ensureCues(session);
     if (!cues.length) {
@@ -906,6 +955,8 @@ import { sniffAvi, openAvi, readAvi, seekAvi } from "../../avi-demux/src/index.j
 import { sniffOgg, openOgg, readOgg, seekOgg } from "../../ogg-demux/src/index.js";
 import { sniffWav, openWav, readWav, seekWav } from "../../wav-demux/src/index.js";
 import { sniffTs, openTs, readTs, seekTs } from "../../ts-demux/src/index.js";
+import { sniffFlac, openFlac, readFlac, seekFlac } from "../../flac-demux/src/index.js";
+import { id3v2Size as flacId3Size } from "../../flac-demux/src/frames.js";
 
 export async function ff_init_decoder(codec_id, codecpar) {
   const name = avcodec_get_name(Number(codec_id));
