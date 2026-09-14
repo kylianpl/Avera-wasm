@@ -966,6 +966,11 @@ export async function ff_init_decoder(codec_id, codecpar) {
       console.log("[sw-dec] décodeur logiciel audio activé (WASM FFmpeg)");
       return [null, ctx, {}, {}];
     }
+    if (name === "dts") {
+      const ctx = await SW.createDCASession(codecpar?.family ? codecpar : { ...codecpar, family: name });
+      console.log("[sw-dec] décodeur logiciel audio activé (WASM FFmpeg)");
+      return [null, ctx, {}, {}];
+    }
     if (name === "pcm") {
       const cp = codecpar ?? {};
       const ctx = await SW.createPCMSession({
@@ -978,8 +983,7 @@ export async function ff_init_decoder(codec_id, codecpar) {
       return [null, ctx, {}, {}];
     }
     if (name === "mp4v" || name === "h263" || name === "msmpeg4v1" ||
-        name === "msmpeg4v2" || name === "msmpeg4v3" || name === "mjpeg") {
-      // Famille MPEG-4 ASP et cousins (XVID/DIVX/H.263/DivX3/MJPEG).
+        name === "msmpeg4v2" || name === "msmpeg4v3" || name === "mjpeg") {      // Famille MPEG-4 ASP et cousins (XVID/DIVX/H.263/DivX3/MJPEG).
       // Noms décodeurs FFmpeg (le v3 s'enregistre "msmpeg4", particularité).
       // MKV VFW : le fourcc réel est dans le BITMAPINFOHEADER (priv+16).
       const DECODERS = { mp4v: "mpeg4", msmpeg4v3: "msmpeg4" };
@@ -998,7 +1002,14 @@ export async function ff_init_decoder(codec_id, codecpar) {
       console.log(`[sw-dec] décodeur logiciel ${decoder} activé (WASM FFmpeg)`);
       return [null, ctx, {}, {}];
     }
-    throw new Error(`SW fallback non migré pour ${name} (Phase 4 : HEVC + (E)AC3 + PCM + MPEG-4/H.263/MJPEG)`);
+    if (name === "mpeg2video") {
+      // MPEG-1/2 (DVD, TV, TS) : jamais supporté WebCodecs.
+      const decoder = "mpeg2video";
+      const ctx = await SW.createMPEG2Session(codecpar, decoder);
+      console.log(`[sw-dec] décodeur logiciel ${decoder} activé (WASM FFmpeg)`);
+      return [null, ctx, {}, {}];
+    }
+    throw new Error(`SW fallback non migré pour ${name} (Phase 4 : HEVC + (E)AC3/DTS + PCM + MPEG-4/H.263/MJPEG/MPEG-2)`);
   }
   const ctx = await SW.createHEVCSession(codecpar);
   console.log("[sw-dec] libde265 : décodage logiciel HEVC activé (WASM)");

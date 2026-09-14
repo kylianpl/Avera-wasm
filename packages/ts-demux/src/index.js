@@ -831,11 +831,15 @@ function emitPes(t, pes, t0, byIdx) {
     });
   } else if (t.family === "mpeg2video") {
     // 1 paquet/image (start codes 0x00000100), clé = séquence présente.
+    // Le 1er morceau part de 0 (pas du 1er 0x100) : il embarque les têtes
+    // (séquence/GOP) qui précèdent — sans le sequence header le décodeur
+    // SW rejette le paquet ("Invalid frame dimensions", vu en test).
     let pics = [];
     for (let i = 0; i + 3 < p.length; i++) {
       if (p[i] === 0 && p[i + 1] === 0 && p[i + 2] === 1 && p[i + 3] === 0x00) pics.push(i);
     }
     if (!pics.length) pics = [0];
+    else if (pics[0] !== 0) pics[0] = 0; // têtes (séquence/GOP) absorbées
     const dur90 = t._fps > 0 ? BigInt(Math.round(90000 / t._fps)) : 3600n;
     pics.forEach((st0, i) => {
       const end = i + 1 < pics.length ? pics[i + 1] : p.length;

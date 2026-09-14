@@ -156,8 +156,18 @@ describe("ts-demux", () => {
     assert.equal(vv.length, 75);
     assert.equal(aa.length, 125);
     assert.deepEqual(vv.map((p) => p.key), vv.map((_, i) => i % 12 === 0)); // GOP 12
-    // SW decode MPEG-2 non migré (étape 6) : échec propre documenté.
-    await assert.rejects(ff_init_decoder(v.codec_id, v.codecpar), /non migré/);
+    // SW decode MPEG-2 (libav WASM) sur les 1ers paquets (bit-exact : voir
+    // tests/sw-decode-mpeg2.test.mjs pour les 75 frames).
+    const [, ctx] = await ff_init_decoder(v.codec_id, v.codecpar);
+    try {
+      const out = await ff_decode_multi(ctx, {}, {}, vv.slice(0, 3));
+      assert.ok(out.length >= 1, "au moins 1 frame MPEG-2");
+      assert.equal(out[0].width, 640);
+      assert.equal(out[0].height, 360);
+      assert.equal(out[0].format, 0);
+    } finally {
+      await ff_free_decoder(ctx);
+    }
   });
 
   it("ac3/eac3 → 75v+94a, têtes parsées (stéréo 48k)", async () => {

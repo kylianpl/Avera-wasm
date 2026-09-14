@@ -47,3 +47,20 @@ Même recette que `vendor/eac3` (voir `vendor/mp4v/BUILD.md`) ; pont C
 `bridge.c` original (slots, I420 dense, rééchantillonnage 422/444→420).
 Utilisé comme décodeur logiciel de secours MPEG-4 ASP (XVID/DIVX),
 H.263, DivX 3 et MJPEG — jamais exposés par WebCodecs.
+
+`packages/sw-decode/vendor/mpeg2/` contient `mpeg2.mjs`, build WebAssembly
+**decode-only** du décodeur natif `mpeg2video` de FFmpeg 8.1.2
+(`libavcodec` + `libavutil`, **LGPL-2.1-or-later** — source :
+https://ffmpeg.org/releases/ffmpeg-8.1.2.tar.xz, non modifiée).
+Même recette que `vendor/mp4v` (voir `vendor/mpeg2/BUILD.md`) ; pont C
+`bridge.c` original (slots, I420 dense, 422→420). Utilisé comme décodeur
+logiciel de secours MPEG-1/2 (DVD, TV, TS — jamais exposé par WebCodecs).
+
+`packages/sw-decode/vendor/dca/` contient `dca.mjs`, build WebAssembly
+**decode-only** du décodeur natif `dca` (DTS core) de FFmpeg 8.1.2
+(`libavcodec` + `libavutil`, **LGPL-2.1-or-later** — source :
+https://ffmpeg.org/releases/ffmpeg-8.1.2.tar.xz, non modifiée).
+Même recette que `vendor/eac3` (voir `vendor/dca/BUILD.md`) ; pont C
+`bridge.c` original (slots, float entrelacé ; FLTP + S32P acceptés —
+les extensions HD sortent en s32p 24 bits, converti). Utilisé comme
+décodeur logiciel de secours DTS (WebCodecs ne l'expose pas).

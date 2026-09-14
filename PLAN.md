@@ -215,3 +215,21 @@ MJPEG jouables (MKV VFW et MP4-mp4v inclus gratis).
   ffprobe exacte, seeks exacts + continuité, buffers uniques.
 - Validé navigateur : mono + stéréo jouent (horloge audio, seek delta 0,
   zéro erreur).
+
+### SW MPEG-2 vidéo + DTS — FAIT (suite 82/82 ✔, dont 3 MPEG-2 + 4 DTS)
+- `packages/sw-decode/vendor/mpeg2/` : build decode-only `mpeg2video`
+  FFmpeg 8.1.2 (487 Ko, même recette ; pas de désentrelacement v1,
+  fixtures `-bf 0` comme mp4v). `MPEG2Session` (forme `MP4VSession`).
+  Démux TS : 1er morceau PES part de 0 (séquence/GOP absorbées — sans
+  le sequence header : "Invalid frame dimensions", vu en test ; pas de
+  paquet header-only : `pics[0] = 0`, parité 75 conservée).
+- `packages/sw-decode/vendor/dca/` : build decode-only `dca` (820 Ko).
+  `DCASession` (forme `EAC3Session`, max 2048 éch./frame). Pont accepte
+  FLTP + S32P (le DTS-HD MA sort en s32p 24 bits — trouvé via MKV E2E).
+  WASM 8.1.2 vs natif 9.0.1 : RMS à 1e-5 près (float LSB inter-versions).
+- Fixtures : ts-mpeg2-mp2.ts (75v+125a, SW 75/75 bit-exact MD5 natif +
+  reprise post-flush), dts-core-4ch.dts (8 frames core extraites de
+  samples.ffmpeg.org 3-1.dts : RMS natifs + déterminisme strict +
+  reprise flush), mkv-avc-dts.mkv (75v+281a DTS-HD MA, E2E SW s32p).
+- Validé navigateur : ts-mpeg2 (SW vidéo + MP2-via-"mp3", seek OK),
+  mkv DTS-HD MA 4ch (SW audio, seek delta 0, zéro erreur).
