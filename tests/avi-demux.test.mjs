@@ -5,7 +5,12 @@
 //   avi-h264-pcm.avi : H264 + PCM s16le (pont logiciel, corrélation = 1)
 //   avi-xvid-mp3.avi : MPEG-4 ASP + MP3 (conteneur OK, décodage non migré)
 //   avi-h264-aac.avi : H264 + AAC RAW (1 chunk = 1 frame, filler "Lavc" skippé)
-// Comptes ffprobe : v75 + a126/a94/a141/a126/a141(+1 filler).
+//   avi-h264bf-mp3.avi : H264 avec B-frames (-bf 3) + MP3 (parité ffprobe)
+//   avi-h264-gapless.avi : H264 + MP3 lame CLI (frame Info réinsérée en tête
+//     de movi : tag LAME delay=576/pad=576, Info skippée, fin exacte 3.0s)
+//   avi-h264-odml.avi : OpenDML synthétique (movi scindé en RIFF AVI + RIFF
+//     AVIX à idx1 propres ; ffprobe : 75v+126a, parité exigée)
+// Comptes ffprobe : v75 + a126/a94/a141/a126/a141(+1 filler)/a126/a127(+Info)/a126.
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
@@ -235,7 +240,55 @@ describe("avi-demux", () => {
     assert.equal(res, AVERROR_EOF);
   });
 
-  it("sans idx1 → lecture complète, seek dégradé à 0", async () => {
+  it("bframes (-bf 3) → 75v+126a, clés 0/25/50, parité ffprobe", async () => {
+    const { session, streams } = await openFile(FIX("avi-h264bf-mp3.avi"));
+    assert.ok(session.avi.hasIndex);
+    const vIdx = streams.find((s) => s.codec_type === AVMEDIA_TYPE_VIDEO).index;
+    const aIdx = streams.find((s) => s.codec_type === AVMEDIA_TYPE_AUDIO).index;
+    const { v, a: ap } = await readAll(session, vIdx, aIdx);
+    assert.equal(v.length, 75);
+    assert.equal(ap.length, 126);
+    // AVI n'a pas de ctts : ffprobe donne pts=N/A, dts=ordinal (ordre de
+    // décodage). On émet pts=dts=ordinal×40ms — parité exacte, y compris
+    // avec B-frames (pas de réordonnancement possible au démux).
+    assert.deepEqual(v.map((p) => p.key), v.map((_, i) => i % 25 === 0));
+    for (let i = 0; i < v.length; i++) {
+      assert.equal(v[i].dts, i * 40000000);
+      assert.equal(v[i].pts, v[i].dts);
+    }
+    assert.equal(ap.length, 126);
+    assert.equal(ap[0].pts, 0);
+    assert.equal(ap[ap.length - 1].pts, 3000000000);
+    for (const p of [...v, ...ap]) assert.equal(p.size, p.data.length);
+    const [res] = await ff_read_frame_multi(session, {}, { limit: 262144 });
+    assert.equal(res, AVERROR_EOF);
+  });
+
+  it("gapless LAME-in-AVI → Info skippée, shift −576, fin exacte 3.0s", async () => {
+    const { session, streams } = await openFile(FIX("avi-h264-gapless.avi"));
+    assert.ok(session.avi.hasIndex);
+    const vIdx = streams.find((s) => s.codec_type === AVMEDIA_TYPE_VIDEO).index;
+    const aIdx = streams.find((s) => s.codec_type === AVMEDIA_TYPE_AUDIO).index;
+    const { v, a: ap } = await readAll(session, vIdx, aIdx);
+    assert.equal(v.length, 75);
+    // ffprobe émet 127 paquets (dont la frame Info) ; on la skippe comme
+    // mp3-demux → 126 paquets audio, divergence documentée d'1 paquet.
+    assert.equal(ap.length, 126);
+    assert.equal(ap[0].pts, 0); // shift −576 éch clampé (576 éch = 12ms)
+    assert.equal(ap[1].pts, 12000000);
+    assert.equal(ap[ap.length - 1].duration, 12000000); // padding rogné
+    assert.equal(ap[ap.length - 1].pts + ap[ap.length - 1].duration, 3000000000);
+    for (let i = 1; i < ap.length; i++) assert.ok(ap[i].pts >= ap[i - 1].pts);
+    // Faux tags "LAME" en ancillaire (ffmpeg) rejetés : pas de shift sauvage.
+    const { session: s2, streams: st2 } = await openFile(FIX("avi-h264bf-mp3.avi"));
+    const av2 = st2.find((s) => s.codec_type === AVMEDIA_TYPE_AUDIO);
+    const { a: ap2 } = await readAll(s2, -1, av2.index);
+    assert.equal(ap2[1].pts, 24000000); // pas de shift (delay=0)
+    const [res] = await ff_read_frame_multi(session, {}, { limit: 262144 });
+    assert.equal(res, AVERROR_EOF);
+  });
+
+  it("sans idx1 → lecture complète + seek réel (recul IDR sondé)", async () => {
     const raw = await readFile(FIX("avi-h264-mp3.avi"));
     const at = raw.indexOf(Buffer.from("idx1")); // début du chunk idx1
     assert.ok(at > 0);
@@ -259,6 +312,33 @@ describe("avi-demux", () => {
     assert.equal(await av_seek_frame(session, vIdx, 2000000000n, 0, 0), 0);
     const [res, dict] = await ff_read_frame_multi(session, {}, { limit: 262144 });
     assert.equal(res, 0);
-    assert.equal(dict[vIdx][0].pts, 0); // reprise à 0 documentée
+    // Recul au précédent IDR sondé (file26, comme avec idx1) + audio cum.
+    assert.ok(dict[vIdx][0].key);
+    assert.equal(dict[vIdx][0].pts, 1040000000);
+    assert.ok(dict[aIdx][0].pts <= 2000000000 && dict[aIdx][0].pts > 1900000000);
+  });
+
+  it("odml (RIFF AVI + AVIX chaînés) → 75v+126a, parité ffprobe + seek", async () => {
+    const { session, streams } = await openFile(FIX("avi-h264-odml.avi"));
+    assert.ok(session.avi.hasIndex);
+    const vIdx = streams.find((s) => s.codec_type === AVMEDIA_TYPE_VIDEO).index;
+    const aIdx = streams.find((s) => s.codec_type === AVMEDIA_TYPE_AUDIO).index;
+    const { v, a: ap } = await readAll(session, vIdx, aIdx);
+    assert.equal(v.length, 75);
+    assert.equal(ap.length, 126);
+    // Mêmes timestamps que le fichier simple (tick du chunk vide file1 :
+    // clés paquets 0/25/50 = ordinals 0/26/51).
+    assert.deepEqual(v.slice(0, 4).map((p) => p.dts), [0, 80000000, 120000000, 160000000]);
+    assert.deepEqual(v.map((p) => p.key), v.map((_, i) => i % 25 === 0));
+    assert.equal(ap[ap.length - 1].pts, 3000000000);
+    // Seek à travers la frontière de segments (~1.46s) : clé + audio continu.
+    assert.equal(await av_seek_frame(session, vIdx, 2000000000n, 0, 0), 0);
+    const { v: v2, a: a2 } = await readAll(session, vIdx, aIdx);
+    assert.ok(v2.length > 0 && v2[0].key);
+    assert.equal(v2[0].dts, 1040000000);
+    assert.ok(a2.length > 0 && a2[0].pts <= 2000000000);
+    assert.equal(a2[a2.length - 1].pts, 3000000000); // jusqu'au bout
+    const [res] = await ff_read_frame_multi(session, {}, { limit: 262144 });
+    assert.equal(res, AVERROR_EOF);
   });
 });

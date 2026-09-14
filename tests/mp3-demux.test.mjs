@@ -1,7 +1,11 @@
 // tests/mp3-demux.test.mjs — démuxeur MP3 maison.
-// Fixtures figées (ffmpeg libmp3lame, sinus 440Hz 48kHz stéréo, 3s) :
+// Fixtures figées (ffmpeg libmp3lame, sinus 440Hz 48kHz stéréo, 3s ;
+// mp3-lame-cbr.mp3 : lame CLI 4.0 mono, vrai tag LAME delay=576/pad=576) :
 //   mp3-cbr.mp3 : CBR 128k + ID3v2 (titre) + frame Info (skippée, cf. ffprobe)
 //   mp3-vbr.mp3 : VBR -q:a 4 + Xing + TOC
+//   mp3-lame-cbr.mp3 : CBR 128k + tag LAME gapless (durée exacte 3.0s)
+//   mp3-unsync.mp3 : ID3v2.3 unsynchronisé (0xFF stuffés, size stockée)
+//   mp3-unsync2.mp3 : idem, size non-stuffée (convention iTunes)
 // Comptes ffprobe : 126 paquets chacun (1152 éch./frame, 1er pts = 0).
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
@@ -118,5 +122,45 @@ describe("mp3-demux", () => {
     assert.equal(await av_seek_frame(session, 0, 999000000000n, 0, 0), 0);
     const [res2] = await ff_read_frame_multi(session, {}, { limit: 262144 });
     assert.equal(res2, AVERROR_EOF);
+  });
+
+  it("gapless LAME → durée exacte 3.0s, fin exacte (réf lame --decode)", async () => {
+    const { session, streams } = await openFile(FIX("mp3-lame-cbr.mp3"));
+    // Vrai tag LAME 4.0 (lame CLI) : delay=576/pad=576, mono 48kHz.
+    assert.equal(session.mp3.lameDelay, 576);
+    assert.equal(session.mp3.lamePad, 576);
+    const cp = await ff_copyout_codecpar(streams[0].codecpar);
+    assert.equal(cp.sample_rate, 48000);
+    assert.equal(cp.channels, 1);
+    // Durée : 126×1152 − 576 − 576 = 144000 éch = 3.0s (3.024s sans trim).
+    const dur = await AVFormatContext_duration(session);
+    assert.equal(dur / AV_TIME_BASE, 3.0);
+    const a = await readAll(session, 0);
+    assert.equal(a.length, 126);
+    // Shift −576 éch clampé : paquet 0 à 0, paquet 1 à 576 éch = 12ms.
+    assert.equal(a[0].pts, 0);
+    assert.equal(a[1].pts, 12000000);
+    for (let i = 2; i < a.length; i++) {
+      assert.equal(a[i].pts, (i * 1152 - 576) * 1000000000 / 48000);
+    }
+    // Dernier paquet rogné du padding : 576 éch = 12ms, fin exacte.
+    assert.equal(a[125].duration, 12000000);
+    assert.equal(a[125].pts + a[125].duration, 3000000000);
+    // Seek cohérent avec le shift : 1.5s → plancher((1.5×48k+576)/1152) = 63.
+    assert.equal(await av_seek_frame(session, 0, 1500000000n, 0, 0), 0);
+    const b = await readAll(session, 0);
+    assert.equal(b[0].pts, (63 * 1152 - 576) * 1000000000 / 48000);
+    assert.equal(b.length, 126 - 63);
+  });
+
+  it("ID3v2 unsynchronisé → 126 paquets, parité CBR (2 conventions de taille)", async () => {
+    for (const f of ["mp3-unsync.mp3", "mp3-unsync2.mp3"]) {
+      const { session } = await openFile(FIX(f));
+      const a = await readAll(session, 0);
+      assert.equal(a.length, 126, f);
+      assert.equal(a[0].pts, 0, f);
+      for (let i = 0; i < a.length; i++) assert.equal(a[i].pts, i * FRAME_NS, `${f} paquet ${i}`);
+      assert.equal(a[125].pts, 3000000000, f);
+    }
   });
 });

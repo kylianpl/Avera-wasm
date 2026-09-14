@@ -109,6 +109,15 @@ export function firstNalType(nals) {
   return -1;
 }
 
+/** Vrai si une NAL est IDR (les chunks IDR ffmpeg commencent par
+ * SPS/PPS/SEI : la 1re NAL n'est PAS l'IDR, d'où ce test). */
+export function nalsHaveIdr(nals) {
+  for (const n of nals) {
+    if (n.length && (n[0] & 0x1f) === 5) return true;
+  }
+  return false;
+}
+
 /** Découpe un chunk audio MP3 en frames [{off,len,spf}]. */
 export function splitMp3Chunk(data) {
   const out = [];

@@ -105,20 +105,25 @@ navigateur (MKV h264+eac3 : 94/94 paquets décodés, seek propre).
 - Validé navigateur : AVC/AAC (WebCodecs), HEVC+EAC3 (double SW),
   fMP4 — seeks delta 0, aucun warning.
 
-### Container AVI — FAIT (tests 34/34 ✔)
-- `packages/avi-demux` (maison-JS, 100% original) : RIFF unique (AVIX
-  refusé explicitement), hdrl (avih + strh/strf/strd/strn), movi
-  (descente récursive incl. 'rec ', chunks ##dc/##db/##wb, pads, chunks
-  vides sautés), idx1 (offsets vérifiés : base movi-type/payload/liste/
-  fichier), sans idx1 : balayage séquentiel (lecture OK, seek → reprise
-  à 0 documentée).
+### Container AVI — FAIT (suite 46/46 ✔, dont 11 AVI + restes v2 ✔)
+- `packages/avi-demux` (maison-JS, 100% original) : RIFF AVI + segments
+  OpenDML/AVIX chaînés (idx1 par segment, offsets relatifs à son movi ;
+  fixture synthétique 75v+126a parité ffprobe), hdrl (avih +
+  strh/strf/strd/strn), movi (descente récursive incl. 'rec ', chunks
+  ##dc/##db/##wb, pads, chunks vides sautés), idx1 (offsets vérifiés :
+  base movi-type/payload/liste/fichier), sans idx1 : balayage séquentiel
+  + seek réel (recul IDR sondé paresseux pour H264 — règle "chunk
+  contient IDR", pas "1re NAL" : les IDR ffmpeg commencent par SPS/PPS).
 - Vidéo : H264 Annex B → avcc (`annexbToAvcc` existant), avcC reconstruit
   des SPS/PPS in-band (strd-avcC accepté), pts=dts=ordinal (les vides
   consomment un tick, parité ffprobe : pts 0,80,120… + durée 3.04s ;
-  pas de ctts en AVI → fixtures -bf 0 ; B-frames non présentables).
+  pas de ctts en AVI → B-frames en ordre de décodage, fixture -bf 3
+  parité ffprobe : 75v+126a, clés 0/25/50).
   XVID/DIVX → mp4v **décodé en SW** (voir ci-dessous), autres fourcc
   verbatim.
-- Audio : MP3 découpé en frames, (E)AC-3 verbatim (1 chunk multi-frames
+- Audio : MP3 découpé en frames (Xing/Info skippée comme mp3-demux ;
+  gapless LAME : shift −delay clampé 0 + padding rogné, faux tags
+  "LAME4.0UUU" ffmpeg rejetés), (E)AC-3 verbatim (1 chunk multi-frames
   OK), PCM verbatim, AAC RAW ffmpeg (1 chunk = 1 frame 1024 éch, filler
   "Lavc" skippé) ou ADTS découpé si sync détectée (+ASC strf ou synthétisé
   LC) ; pts cumulés exacts (pas d'estimation), tags 0xFFFE/inconnus sniffés.
@@ -129,10 +134,10 @@ navigateur (MKV h264+eac3 : 94/94 paquets décodés, seek propre).
   data/size → buffer dupliqué dans la transfer list → postMessage qui
   jette le batch) — corrigé + assertion buffers-uniques en test.
 - Validé navigateur : h264+mp3 (WebCodecs), h264+ac3 (SW), h264+pcm
-  (pont), h264+aac RAW (WebCodecs, ASC 1190), xvid+mp3 (SW mpeg4, 59fps),
-  seeks delta 0, zéro warning.
-- Limites v1 : OpenDML/AVIX, seek sans idx1, B-frames AVI, sous-titres
-  'tx'.
+  (pont), h264+aac RAW (WebCodecs, ASC 1190), h264+mp3 -bf 3 (B-frames),
+  xvid+mp3 (SW mpeg4, 59fps), seeks delta 0 (y compris sans idx1 et
+  trans-segments ODML), zéro warning.
+- Limites v1 : sous-titres 'tx'.
 
 ### Vidéo MPEG-4 ASP et cousins — FAIT (tests 40/40 ✔)
 Build maison decode-only FFmpeg 8.1.2 (`mpeg4` + `h263` + `msmpeg4v1/v2/v3`
@@ -148,15 +153,18 @@ reprise post-seek bit-exacte depuis clé. Branché dans `compat.js`
 (`mp4v`→mpeg4, VFW-affiné, h263/msmpeg4/mjpeg) : XVID/DIVX/DivX3/H.263/
 MJPEG jouables (MKV VFW et MP4-mp4v inclus gratis).
 
-### Container MP3 — FAIT (tests 27/27 ✔)
-- `packages/mp3-demux` (maison-JS, 100% original) : ID3v2 (sauf
-  unsynchronisation) + APEv2 de tête toléré, frames MPEG Layer I/II/III
-  (MPEG 1/2/2.5), Xing/Info (durée exacte ; frame Info skippée comme
-  ffprobe), ID3v1 exclu, ouverture légère (tête seule).
+### Container MP3 — FAIT (suite 46/46 ✔, dont 8 MP3 + gapless/unsync ✔)
+- `packages/mp3-demux` (maison-JS, 100% original) : ID3v2 (y compris
+  unsynchronisation : resync lookahead, 2 conventions de taille testées)
+  + APEv2 de tête toléré, frames MPEG Layer I/II/III (MPEG 1/2/2.5),
+  Xing/Info (durée exacte ; frame Info skippée comme ffprobe), ID3v1
+  exclu, ouverture légère (tête seule).
 - Index de frames EXACT et dense, étendu paresseusement par fenêtres :
   pts exacts après seek sans estimation (ni TOC ni proportionnel).
-  Lookahead anti faux-sync, free-format refusé, gapless LAME ignoré
-  (documenté, comme ffprobe : 1er pts = 0).
+  Lookahead anti faux-sync, free-format refusé, gapless LAME : delay/
+  padding du tag parsés (`parseLameTag`, faux "LAME4.0UUU" rejeté),
+  shift PTS clampé 0 + durée exacte (réf `lame --decode` : 144000 éch),
+  seek cohérent avec le shift.
 - Routeur (sniff ID3/sync) + dispatch ; contrat inchangé. Audio-only
   vérifié navigateur (overlay "No Video", horloge audio, seek OK).
 - Fixtures : mp3-cbr (ID3v2+Info), mp3-vbr (Xing+TOC) — 126 paquets

@@ -1,15 +1,17 @@
 // packages/mp3-demux/src/index.js — démuxeur MP3 maison (streaming-friendly).
-// ID3v2 (sauf unsynchronisation) + APEv2 toléré en tête, frames MPEG
-// Layer I/II/III, Xing/Info (durée exacte), ID3v1 exclu.
+// ID3v2 (y compris unsynchronisation : le scan de sync qui suit tolère les
+// deux conventions de taille, voir skipLeadingTags) + APEv2 toléré en tête,
+// frames MPEG Layer I/II/III, Xing/Info (durée exacte), ID3v1 exclu.
 // Ouverture légère (tête seule). Index de frames EXACT et dense, étendu par
 //esse (fenêtres 1MiB, chaque frame parsée une seule fois) : les pts
 // (idx*spf/sr) restent exacts même après seek, sans estimation.
 // Lecture : lectures exactes par frame (blocs 1MiB en cache côté lib).
-// Timestamps bruts depuis 0 (délai d'encodeur LAME ignoré, comme ffprobe).
+// Gapless LAME : delay/padding du tag parsés (shift PTS + durée exacte,
+// clamp à 0 — le player compare des horloges, cf. worker.js).
 // Limites v1 : free-format refusé, fichiers hétérogènes concaténés
-// (version/layer/sr changeants) non supportés, pas de gapless LAME.
+// (version/layer/sr changeants) non supportés.
 
-import { parseFrameHeader, sameStream, parseXing, id3v2Size } from "./frames.js";
+import { parseFrameHeader, sameStream, parseXing, parseLameTag, id3v2Size } from "./frames.js";
 
 const WINDOW = 1048576;
 const MAX_PACKETS_PER_READ = 400;
@@ -28,8 +30,12 @@ async function skipLeadingTags(source, size) {
   let off = 0n;
   const head = await source.read(0n, 64);
   const tag = id3v2Size(head.subarray(0, Math.min(10, head.length)));
-  if (tag) {
-    if (tag.flags & 0x80) throw new Error("ID3v2 unsynchronisation non supportée");
+  if (tag && tag.size !== undefined) {
+    // Unsynchronisation (flag 0x80) : des 0x00 sont insérés après chaque
+    // 0xFF du tag. Ambiguïté historique : `size` compte les octets stockés
+    // (ffmpeg) ou dé-stuffés (iTunes). Dans les deux cas le resync qui suit
+    // (double sync + lookahead) retrouve la 1re frame : hint exact ou
+    // légèrement en avance dans la queue du tag (junk inoffensif).
     off = BigInt(tag.size) + (tag.flags & 0x10 ? 10n : 0n); // footer éventuel
   }
   if (off + 32n < size) {
@@ -102,6 +108,9 @@ export async function openMp3(source) {
   const h0 = parseFrameHeader(probe, 0);
   if (!h0) throw new Error("en-tête MP3 illisible");
   const xing = parseXing(probe.subarray(0, Math.min(h0.frameLen, probe.length)));
+  // Gapless : tag LAME (1re frame). Absent des CBR ffmpeg (pas de Xing).
+  const lame = parseLameTag(probe.subarray(0, Math.min(h0.frameLen, probe.length)));
+  const lameDelay = lame?.delay ?? 0, lamePad = lame?.pad ?? 0;
   let start = first;
   if (xing) {
     // Frame Xing/Info : métadonnée, pas de l'audio (ffprobe ne l'émet pas
@@ -117,7 +126,9 @@ export async function openMp3(source) {
   const sr = h0.sampleRate, spf = h0.samplesPerFrame;
   let durationNs;
   if (xing && xing.numFrames > 0) {
-    durationNs = (BigInt(xing.numFrames) * BigInt(spf) * 1000000000n) / BigInt(sr);
+    // Total exact : frames − délai − padding (réf lame --decode : N éch).
+    const total = BigInt(xing.numFrames) * BigInt(spf) - BigInt(lameDelay) - BigInt(lamePad);
+    durationNs = (total > 0n ? total : BigInt(xing.numFrames) * BigInt(spf)) * 1000000000n / BigInt(sr);
   } else {
     durationNs = ((audioEnd - start) * 8n * 1000000000n) / BigInt(h0.bitrate);
   }
@@ -148,6 +159,7 @@ export async function openMp3(source) {
     mp3: {
       track, first: start, audioEnd, xing, spf,
       bitrate: h0.bitrate, header0: h0,
+      lameDelay, lamePad,
       index: [start], // offsets exacts des frames, dense depuis 0
       cursorIdx: 0,
     },
@@ -269,15 +281,18 @@ export async function readMp3(session, lib, name, opts = {}) {
       session.readPos = session.size;
       return { res: 0, eof: true, byIdx };
     }
-    const samp = BigInt(st.cursorIdx) * BigInt(st.spf);
+    const samp = BigInt(st.cursorIdx) * BigInt(st.spf) - BigInt(st.lameDelay);
+    const pts = samp <= 0n ? 0 : nsOfSamples(samp, t.timescale);
+    // Dernière frame du stream : durée rognée du padding (gapless).
+    const lastSamp = st.spf - (off + BigInt(h.frameLen) >= st.audioEnd ? st.lamePad : 0);
     (byIdx[t.index] = byIdx[t.index] ?? []).push({
-      pts: nsOfSamples(samp, t.timescale),
-      dts: nsOfSamples(samp, t.timescale),
+      pts,
+      dts: pts,
       size: data.length,
       data,
       time_base_num: 1,
       time_base_den: 1000000000,
-      duration: nsOfSamples(BigInt(st.spf), t.timescale),
+      duration: nsOfSamples(BigInt(lastSamp > 0 ? lastSamp : st.spf), t.timescale),
       key: true,
     });
     st.cursorIdx++;
@@ -288,11 +303,12 @@ export async function readMp3(session, lib, name, opts = {}) {
   return { res: 0, eof: false, byIdx };
 }
 
-/** Seek exact : idx = plancher(cible/spf), extension d'index si besoin. */
+/** Seek exact : idx = plancher((cible+delay)/spf), extension si besoin. */
 export function seekMp3Prepare(session, targetNs) {
   const st = session.mp3;
   const sr = st.track.timescale;
-  let idx = Number((BigInt(targetNs) * BigInt(sr)) / 1000000000n / BigInt(st.spf));
+  const adj = BigInt(targetNs) * BigInt(sr) + BigInt(st.lameDelay) * 1000000000n;
+  let idx = Number(adj / 1000000000n / BigInt(st.spf));
   if (!Number.isFinite(idx) || idx < 0) idx = 0;
   return idx;
 }

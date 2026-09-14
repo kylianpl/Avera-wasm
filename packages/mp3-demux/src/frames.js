@@ -86,6 +86,46 @@ export function parseXing(frame) {
   return out;
 }
 
+/**
+ * Tag d'encodeur LAME dans une frame (extension du Xing/Info).
+ * Retourne { delay, pad } (échantillons à retirer en tête/fin de stream)
+ * ou null. Garde-fous : magic Xing/Info à l'offset side-info, "LAME" +
+ * version chiffrée ("3.100", pas du bourrage 0x55) à +120, delay/pad
+ * ≤ 4096. Rejette notamment le faux tag "LAME4.0UUU…" qu'écrit ffmpeg
+ * en ancillaire (pas de magic Xing autour).
+ */
+export function parseLameTag(frame) {
+  if (!frame || frame.length < 4) return null;
+  const h = parseFrameHeader(frame, 0);
+  if (!h || h.layer !== 3) return null; // LAME = Layer III uniquement
+  const base = 4 + h.sideLen;
+  if (base + 8 > frame.length) return null;
+  const magic = String.fromCharCode(frame[base], frame[base + 1], frame[base + 2], frame[base + 3]);
+  if (magic !== "Xing" && magic !== "Info") return null;
+  // Extension LAME à +120 (MPEG1) ; repli : scan borné (MPEG2/LSF court).
+  let lm = -1;
+  if (base + 120 + 24 <= frame.length &&
+      frame[base + 120] === 0x4c && frame[base + 121] === 0x41 &&
+      frame[base + 122] === 0x4d && frame[base + 123] === 0x45) {
+    lm = base + 120;
+  } else {
+    const end = Math.min(frame.length - 24, base + 512);
+    for (let i = base + 4; i <= end; i++) {
+      if (frame[i] === 0x4c && frame[i + 1] === 0x41 && frame[i + 2] === 0x4d && frame[i + 3] === 0x45) {
+        lm = i;
+        break;
+      }
+    }
+  }
+  if (lm < 0 || lm + 24 > frame.length) return null;
+  // Version "x.yy" chiffrée (rejette le bourrage 0x55/texte libre).
+  const isDig = (c) => c >= 0x30 && c <= 0x39;
+  if (!isDig(frame[lm + 4]) || frame[lm + 5] !== 0x2e || !isDig(frame[lm + 6])) return null;
+  const delay = (frame[lm + 21] << 4) | (frame[lm + 22] >> 4);
+  const pad = ((frame[lm + 22] & 0x0f) << 8) | frame[lm + 23];
+  if (delay > 4096 || pad > 4096) return null;
+  return { delay, pad };
+}
 /** Taille du tag ID3v2 à partir de 10 octets d'en-tête (synchsafe). -1 si pas ID3. */
 export function id3v2Size(head10) {
   if (head10.length < 10 || head10[0] !== 0x49 || head10[1] !== 0x44 || head10[2] !== 0x33) return -1;

@@ -14,11 +14,12 @@ import { LR, chunkHeader, chunkEnd } from "./riff.js";
 import { parseAvih, parseStrl } from "./hdrl.js";
 import {
   T_VIDEO, T_AUDIO, mapVideoCodec, mapAudioTag, AUDIO_IDS,
-  detectH264Format, buildAvcC, findParamSets, firstNalType,
+  detectH264Format, buildAvcC, findParamSets, nalsHaveIdr,
   splitMp3Chunk, splitAdtsChunk, parseAdtsHeader, sniffAudioChunk,
 } from "./codecs.js";
 import { splitAnnexB, annexbToAvcc } from "../../mkv-demux/src/annexb.js";
 import { splitAc3Frames, ac3FrameSamples } from "../../sw-decode/src/ac3frames.js";
+import { parseFrameHeader, parseXing, parseLameTag } from "../../mp3-demux/src/frames.js";
 
 const MAX_TOP_CHUNKS = 4096;
 const MAX_MOVI_CHUNKS = 2000000;
@@ -85,9 +86,11 @@ export async function openAvi(source) {
   if (size < 12n) throw new Error("fichier trop petit pour AVI");
   const head = await source.read(0n, 12);
   if (!sniffAvi(head)) throw new Error("pas un RIFF AVI");
-  // Top-level : hdrl, movi, idx1 (+ JUNK/INFO sautés). AVIX → refusé (v1).
+  // Top-level : hdrl, movi, idx1 (+ JUNK/INFO sautés). OpenDML/AVIX :
+  // segments RIFF chaînés, chacun avec son LIST movi (+ idx1 propre).
   let off = 12n;
-  let hdrl = null, movi = null, idx1 = null;
+  let hdrl = null;
+  const segments = []; // { movi, idx1 }
   for (let g = 0; g < MAX_TOP_CHUNKS && off + 8n <= size; g++) {
     const hb = await source.read(off, 16);
     if (hb.length < 12) break;
@@ -98,21 +101,37 @@ export async function openAvi(source) {
         const payload = await source.read(off + 12n, Number(BigInt(h.size) - 4n));
         hdrl = { payload, off };
       } else if (h.listType === "movi") {
-        if (movi) throw new Error("plusieurs LIST movi (OpenDML ? non supporté v1)");
-        movi = { listOff: off, payloadOff: off + 12n, size: BigInt(h.size) - 4n };
+        segments.push({
+          movi: { listOff: off, payloadOff: off + 12n, size: BigInt(h.size) - 4n },
+          idx1: null,
+        });
       }
       // INFO/autres LIST : sautées.
     } else if (h.id === "RIFF") {
-      throw new Error("AVI OpenDML multi-segments (AVIX) non supporté (v1 : RIFF unique)");
+      // Segment OpenDML : le type suit l'en-tête (AVIX attendu). On
+      // DESCEND dedans (pas de chunkEnd : il skippingait les enfants).
+      const sub = hb.length >= 12
+        ? String.fromCharCode(hb[8], hb[9], hb[10], hb[11]) : "";
+      if (sub !== "AVIX") throw new Error(`RIFF inattendu (${sub || "?"}) : OpenDML exige AVIX`);
+      off += 12n;
+      continue;
     } else if (h.id === "idx1") {
-      idx1 = { off: off + 8n, size: BigInt(h.size) };
+      const e = { off: off + 8n, size: BigInt(h.size) };
+      // Rattaché au dernier segment sans idx1 (en pratique : celui qui
+      // précède), sinon au dernier (fichiers à index regroupés).
+      let seg = null;
+      for (let i = segments.length - 1; i >= 0; i--) {
+        if (!segments[i].idx1) { seg = segments[i]; break; }
+      }
+      const tgt = seg ?? segments[segments.length - 1];
+      if (tgt) tgt.idx1 = e; // idx1 orphelin (avant tout movi) : ignoré
     }
     const nx = chunkEnd(off, { hdr: h.hdr, size: BigInt(h.size) });
     if (nx <= off) break;
     off = nx;
   }
   if (!hdrl) throw new Error("hdrl introuvable");
-  if (!movi) throw new Error("movi introuvable");
+  if (!segments.length) throw new Error("movi introuvable");
   // hdrl → avih + streams.
   const { avih, streams: rawStreams } = parseHdrl(hdrl.payload);
   const tracks = [];
@@ -123,13 +142,24 @@ export async function openAvi(source) {
     tracks.push(buildTrack(s, i));
   }
   if (!tracks.length) throw new Error("aucune piste A/V");
-  // Chunks : idx1 vérifié, sinon balayage movi.
+  // Chunks : idx1 vérifié par segment, sinon balayage movi du segment.
+  // (OpenDML : les offsets idx1 sont relatifs au movi de leur segment ;
+  // applyIdx1 re-vérifie chaque entrée sur place.)
   let hasIndex = false;
-  if (idx1) {
-    hasIndex = await applyIdx1(source, idx1, movi, tracks);
+  const applied = new Set();
+  for (const seg of segments) {
+    if (seg.idx1) {
+      try {
+        if (await applyIdx1(source, seg.idx1, seg.movi, tracks)) {
+          hasIndex = true;
+          applied.add(seg);
+        }
+      } catch {}
+    }
   }
-  if (!hasIndex) {
-    await walkMovi(source, movi, size, tracks);
+  // Repli : balaye les segments sans index valide (tout si aucun).
+  for (const seg of segments) {
+    if (!applied.has(seg)) await walkMovi(source, seg.movi, size, tracks);
   }
   for (const t of tracks) {
     t.chunks.sort((a, b) => (a.off < b.off ? -1 : 1));
@@ -151,6 +181,9 @@ export async function openAvi(source) {
     }
     if (t.ffCodecType === T_AUDIO && t.family === "aac" && t.chunks.length) {
       await initAacMode(source, t);
+    }
+    if (t.ffCodecType === T_AUDIO && t.family === "mp3" && t.chunks.length) {
+      await initMp3Gapless(source, t);
     }
   }
   // Durée : vidéo (ordinal exact), sinon -1 (audio-only : strh peu fiable).
@@ -212,6 +245,8 @@ function buildTrack(s, index) {
     cursor: 0,
     cum: [0n], // audio : échantillon de départ du chunk i (BigInt)
     _aacAdts: false, // AAC : true si chunks ADTS (headers à retirer), sinon RAW
+    _lameDelay: 0, _lamePad: 0, // MP3 gapless (échantillons ; cum[0] = −delay)
+    _lastAudioOrd: -1, // dernier ordinal non vide (rogne du padding LAME)
     h264: null,
     bitsPerSample: 0,
     isFloat: false,
@@ -376,7 +411,8 @@ async function applyIdx1(source, idx1, movi, tracks) {
     per[si].push({ off: abs + 8n, size: sz, key: !!(flags & 0x10), id });
   }
   if (!per.some((a) => a.length)) return false;
-  for (let i = 0; i < tracks.length; i++) tracks[i].chunks = per[i];
+  // Append (pas d'assignation) : OpenDML chaine plusieurs idx1/segments.
+  for (let i = 0; i < tracks.length; i++) tracks[i].chunks.push(...per[i]);
   return true;
 }
 
@@ -477,6 +513,40 @@ async function sniffAudioTrack(source, t) {
   if (fam === "aac") t._aacAdts = true; // sniffé par sync ADTS → mode ADTS
 }
 
+/** Gapless MP3-in-AVI : scanne les premiers chunks + le dernier à la
+ * recherche du tag LAME (Xing/Info). Le faux tag "LAME4.0UUU" de ffmpeg
+ * (ancillaire, sans magic Xing) est rejeté par parseLameTag. */
+async function initMp3Gapless(source, t) {
+  const ords = [];
+  for (let i = 0; i < t.chunks.length && ords.length < 4; i++) {
+    if (t.chunks[i].size > 0) ords.push(i);
+  }
+  for (let i = t.chunks.length - 1; i >= 0; i--) {
+    if (t.chunks[i].size > 0) {
+      t._lastAudioOrd = i;
+      if (!ords.includes(i)) ords.push(i);
+      break;
+    }
+  }
+  for (const i of ords) {
+    const c = t.chunks[i];
+    let data;
+    try {
+      data = await source.read(c.off, Math.min(c.size, 8192));
+    } catch {
+      continue;
+    }
+    if (!data.length || !parseFrameHeader(data, 0)) continue;
+    const h = parseFrameHeader(data, 0);
+    const lame = parseLameTag(data.subarray(0, Math.min(h.frameLen, data.length)));
+    if (lame && (lame.delay > 0 || lame.pad > 0)) {
+      t._lameDelay = lame.delay;
+      t._lamePad = lame.pad;
+      t.cum = [BigInt(-lame.delay)];
+      return;
+    }
+  }
+}
 /** AAC-in-AVI : ffmpeg multiplexe des frames RAW (1 chunk = 1 frame 1024
  * échantillons, ASC dans strf), pas de l'ADTS. Certains muxers écrivent de
  * l'ADTS : on tranche en testant la sync sur les premiers chunks non vides
@@ -501,12 +571,20 @@ async function initAacMode(source, t) {
   t._aacAdts = false;
 }
 
-/** Échantillons d'un chunk audio décodé (sans émission). */
-function countChunkSamples(t, data) {
+/** Échantillons d'un chunk audio décodé (sans émission). `ord` = ordinal
+ * du chunk (rogne du padding LAME sur le dernier, comme à l'émission). */
+function countChunkSamples(t, data, ord = t.cursor) {
   switch (t.family) {
     case "mp3": {
       let n = 0;
-      for (const f of splitMp3Chunk(data)) n += f.spf;
+      // Xing/Info : métadonnée sautée (cf. émission) ; le padding LAME
+      // rogne la durée du dernier vrai frame.
+      const frames = splitMp3Chunk(data).filter(
+        (f) => !parseXing(data.subarray(f.off, f.off + f.len)));
+      const last = t._lamePad > 0 && ord === t._lastAudioOrd;
+      frames.forEach((f, i) => {
+        n += last && i === frames.length - 1 ? Math.max(1, f.spf - t._lamePad) : f.spf;
+      });
       return n;
     }
     case "ac3":
@@ -537,8 +615,8 @@ function countChunkSamples(t, data) {
 }
 
 /** Étend cum[] (échantillons cumulés par chunk) jusqu'à couvrir `unit`.
- * cum[i] = échantillon de départ du chunk i ; cum[0] = 0. L'émission
- * (packetsForChunk) pose cum[cursor+1] à chaque chunk émis, donc en lecture
+ * cum[i] = échantillon de départ du chunk i ; cum[0] = 0 (−delay en
+ * gapless LAME). L'émission (packetsForChunk) pose cum[cursor+1] à chaque
  * séquentielle les bases existent toujours. Seul un seek peut sauter par
  * dessus des chunks non mesurés : extendCum les mesure alors en relisant
  * leurs données (cache 1MiB : borné et paresseux). */
@@ -555,7 +633,7 @@ async function extendCum(lib, name, t, unit) {
       break;
     }
     if (!data || data.length < c.size) break;
-    t.cum[i + 1] = t.cum[i] + BigInt(countChunkSamples(t, data));
+    t.cum[i + 1] = t.cum[i] + BigInt(countChunkSamples(t, data, i));
     if (t.cum[i + 1] >= unit) break;
   }
 }
@@ -625,7 +703,7 @@ function packetsForChunk(t, c, data, hasIndex) {
       if ((t.h264.format ?? "annexb") === "annexb") {
         const nals = splitAnnexB(data);
         payload = annexbToAvcc(data);
-        if (!hasIndex) key = firstNalType(nals) === 5;
+        if (!hasIndex) key = nalsHaveIdr(nals);
       } else if (!hasIndex) {
         key = keyIsIdrAvcc(data);
       }
@@ -648,9 +726,13 @@ function packetsForChunk(t, c, data, hasIndex) {
   let acc = 0;
   const out = [];
   const pushPcm = (samples, bytes) => {
+    // Gapless LAME : cum[0] = −delay → pts négatifs clampés à 0 (le player
+    // compare des horloges ; le relatif reste exact à l'échantillon).
+    const q = base + BigInt(acc);
+    const ts = q <= 0n ? 0 : nsSamp(q, sr);
     out.push({
-      pts: nsSamp(base + BigInt(acc), sr),
-      dts: nsSamp(base + BigInt(acc), sr),
+      pts: ts,
+      dts: ts,
       size: bytes.length, data: bytes,
       time_base_num: 1, time_base_den: 1000000000,
       duration: nsSamp(BigInt(samples), sr), key: true,
@@ -658,9 +740,17 @@ function packetsForChunk(t, c, data, hasIndex) {
     acc += samples;
   };
   if (t.family === "mp3") {
-    for (const f of splitMp3Chunk(data)) {
-      pushPcm(f.spf, Uint8Array.from(data.subarray(f.off, f.off + f.len)));
-    }
+    const frames = splitMp3Chunk(data).filter(
+      (f) => !parseXing(data.subarray(f.off, f.off + f.len)));
+    // Dernier chunk audio : le padding LAME rogne la durée du dernier paquet.
+    const last = t._lamePad > 0 && t.cursor === t._lastAudioOrd;
+    frames.forEach((f, i) => {
+      // Frame Xing/Info : métadonnée, pas de l'audio (comme mp3-demux ;
+      // ffprobe l'émet en AVI — divergence documentée d'1 paquet).
+      const raw = data.subarray(f.off, f.off + f.len);
+      const spf = last && i === frames.length - 1 ? Math.max(1, f.spf - t._lamePad) : f.spf;
+      pushPcm(spf, Uint8Array.from(raw));
+    });
   } else if (t.family === "ac3" || t.family === "eac3") {
     const frames = splitAc3Frames(data);
     if (!frames.length) {
@@ -700,10 +790,10 @@ function packetsForChunk(t, c, data, hasIndex) {
   return out;
 }
 
-/** Première NAL == IDR dans un chunk avcc (repli sans idx1). */
+/** IDR présent dans un chunk avcc (repli sans idx1 ; SPS/PPS en tête). */
 function keyIsIdrAvcc(data) {
   try {
-    return firstNalType(avccNals(data)) === 5;
+    return nalsHaveIdr(avccNals(data));
   } catch {
     return false;
   }
@@ -724,13 +814,103 @@ function avccNals(data) {
 }
 
 /** Seek : vidéo par ordinal+clé, audio par cumul exact (extension paresseuse). */
+/** Sonde clé d'un chunk vidéo sans idx1 (cache dans c.key).
+ * H264 : chunk CONTENANT une NAL IDR (les IDR ffmpeg commencent par
+ * SPS/PPS/SEI — même règle qu'à l'émission) ; autres codecs : pas
+ * d'info → false (seek à l'ordinal, approximatif documenté). Rater un
+ * IDR ne casse rien (départ plus tôt) ; un faux positif si (extradata
+ * avcC de secours : l'IDR reste décodable). */
+async function probeKeyChunk(lib, name, t, k) {
+  const c = t.chunks[k];
+  if (c.key || c.size === 0 || !c.size) return c.key;
+  if (t.family !== "h264") return false;
+  let head;
+  try {
+    head = await lib.read(name, c.off, Math.min(c.size, 2048));
+  } catch {
+    return false;
+  }
+  if (!head || head.length < 5) return false;
+  let isIdr = false;
+  if (t.h264?.format === "avcc") {
+    let p = 0;
+    while (p + 5 <= head.length) {
+      const l = (head[p] * 0x1000000) + ((head[p + 1] << 16) | (head[p + 2] << 8) | head[p + 3]);
+      if (l <= 0 || p + 4 + l > c.size) break; // taille vs chunk réel (tête tronquée)
+      if ((head[p + 4] & 0x1f) === 5) { isIdr = true; break; }
+      p += 4 + l;
+    }
+  } else {
+    // Annex B : balaye les start codes de la tête (SPS/PPS/IDR en tête).
+    for (let i = 0; i + 4 < head.length; i++) {
+      if (head[i] === 0 && head[i + 1] === 0 &&
+        (head[i + 2] === 1 || (head[i + 2] === 0 && head[i + 3] === 1))) {
+        const t0 = head[i + 2] === 1 ? head[i + 3] : head[i + 4];
+        if ((t0 & 0x1f) === 5) { isIdr = true; break; }
+      }
+    }
+  }
+  if (isIdr) c.key = true; // cache (cohérent avec l'émission sans idx1)
+  return isIdr;
+}
+
+/** Seek audio par échantillons cumulés (avec ou sans idx1 : extendCum
+ * paresseux + dichotomie, troncature de cum au curseur). */
+async function seekAudioCum(session, lib, name, t, targetNs) {
+  const sr = t.timescale || t.sampleRate || 1;
+  const unit = (BigInt(targetNs < 0n ? 0n : targetNs) * BigInt(sr)) / 1000000000n;
+  await extendCum(lib, name, t, unit).catch(() => {});
+  let lo = 0, hi = t.cum.length - 1;
+  if (hi < 0) { t.cursor = 0; return; }
+  while (lo < hi) {
+    const m = (lo + hi + 1) >> 1;
+    if (t.cum[m] <= unit) lo = m;
+    else hi = m - 1;
+  }
+  t.cursor = Math.min(lo, t.chunks.length);
+  t.cum.length = Math.min(t.cum.length, t.cursor + 1);
+}
+
 export async function seekAvi(session, lib, name, targetNs) {
   const tracks = session.avi.tracks;
   const hasIndex = session.avi.hasIndex;
   if (!hasIndex) {
-    for (const t of tracks) t.cursor = 0;
-    const rp = session.size;
-    session.readPos = rp;
+    // Sans idx1 : seek réel quand même. Vidéo H264 : ordinal + recul au
+    // précédent IDR sondé (têtes de chunks, cache) ; autres codecs :
+    // ordinal brut (pas d'info clé — approximatif). Audio : cum exact.
+    for (const t of tracks) {
+      if (!t.chunks.length) { t.cursor = 0; continue; }
+      if (t.ffCodecType === T_VIDEO) {
+        const dur = t.frameDurNs > 0n ? t.frameDurNs : 40000000n;
+        let ord = Number(BigInt(targetNs < 0n ? 0n : targetNs) / dur);
+        if (ord < 0) ord = 0;
+        if (ord >= t.chunks.length) ord = t.chunks.length - 1;
+        let k = ord;
+        if (t.family === "h264") {
+          while (k > 0) {
+            const c = t.chunks[k];
+            if (c.size === 0) { k--; continue; }
+            try {
+              if (await probeKeyChunk(lib, name, t, k)) break;
+            } catch {}
+            k--;
+          }
+        } else {
+          while (k < t.chunks.length && t.chunks[k].size === 0) k++;
+          t.cursor = Math.min(Math.max(0, k), t.chunks.length);
+          continue;
+        }
+        while (k < t.chunks.length && t.chunks[k].size === 0) k++;
+        t.cursor = Math.min(Math.max(0, k), t.chunks.length);
+      } else {
+        await seekAudioCum(session, lib, name, t, targetNs);
+      }
+    }
+    let rp2 = session.size;
+    for (const t of tracks) {
+      if (t.cursor < t.chunks.length && t.chunks[t.cursor].off < rp2) rp2 = t.chunks[t.cursor].off;
+    }
+    session.readPos = rp2;
     session.eof = false;
     return;
   }
@@ -753,22 +933,8 @@ export async function seekAvi(session, lib, name, targetNs) {
       while (k < t.chunks.length && t.chunks[k].size === 0) k++;
       t.cursor = Math.min(Math.max(0, k), t.chunks.length);
     } else {
-      // Audio : unité = échantillons @sr.
-      const sr = t.timescale || t.sampleRate || 1;
-      const unit = (BigInt(targetNs < 0n ? 0n : targetNs) * BigInt(sr)) / 1000000000n;
-      await extendCum(lib, name, t, unit).catch(() => {});
-      // Dernier chunk avec cumStart <= unit.
-      let lo = 0, hi = t.cum.length - 1;
-      if (hi < 0) { t.cursor = 0; continue; }
-      while (lo < hi) {
-        const m = (lo + hi + 1) >> 1;
-        if (t.cum[m] <= unit) lo = m;
-        else hi = m - 1;
-      }
-      t.cursor = Math.min(lo, t.chunks.length);
-      // Tronque cum au curseur : cum[cursor] reste défini, la suite se
-      // reconstruira à la lecture (pas de trou dans l'index).
-      t.cum.length = Math.min(t.cum.length, t.cursor + 1);
+      // Audio : unité = échantillons @sr (cum, cf. seekAudioCum).
+      await seekAudioCum(session, lib, name, t, targetNs);
     }
   }
   let rp = session.size;
