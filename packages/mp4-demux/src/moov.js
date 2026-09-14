@@ -193,7 +193,7 @@ function parseStsdEntry(payload, kind) {
     }
   } catch {}
   // Repli tag-search (mises en page exotiques) pour les configs codec.
-  for (const t of ["avcC", "hvcC", "esds", "dac3", "dec3", "dOps", "dfLa"]) {
+  for (const t of ["avcC", "hvcC", "av1C", "vpcC", "esds", "dac3", "dec3", "dOps", "dfLa"]) {
     if (!e.boxes.has(t)) {
       const found = tagSearch(payload, [t]).get(t);
       if (found) e.boxes.set(t, found);

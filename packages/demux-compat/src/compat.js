@@ -292,6 +292,13 @@ export async function ff_init_demuxer_file(lib, name) {
       t.profile = pl.profile; t.level = pl.level;
     }
     if (m.family === "aac") t.audioProfile = aacProfile(priv);
+    if (m.family === "opus" && priv.length >= 12 &&
+        priv[0] === 0x4f && priv[1] === 0x70 && priv[2] === 0x75 && priv[3] === 0x73) {
+      // OpusHead ("OpusHead", LE) : pre-skip à +10, @48kHz interne.
+      t._opusPreskip = priv[10] | (priv[11] << 8);
+    } else {
+      t._opusPreskip = 0;
+    }
   }
   const segEnd = await findSegmentEnd(lib, name, idx, v.size);
   let chapters = [];
@@ -684,9 +691,14 @@ function routeBlocks(session, blocks, byIdx) {
       : (track.defaultDurationNs > 0n ? track.defaultDurationNs : 0n);
     for (const f of b.frames) {
       const data = payload.slice(f.off, f.off + f.len);
+      // Opus : pre-skip retranché, clampé à 0 (cf. MP4, motif delay LAME).
+      // Autres pistes : timestamps bruts.
+      const opsh = track._opusPreskip
+        ? Number((BigInt(track._opusPreskip) * 1000000000n) / 48000n) : 0;
+      const ts = opsh ? Math.max(0, Number(b.ptsNs) - opsh) : Number(b.ptsNs);
       byIdx[idx].push({
-        pts: Number(b.ptsNs), // ticks ns (timebase 1/1e9)
-        dts: Number(b.ptsNs),
+        pts: ts, // ticks ns (timebase 1/1e9)
+        dts: ts,
         size: data.length,
         data,
         time_base_num: 1,

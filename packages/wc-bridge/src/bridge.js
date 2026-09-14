@@ -51,12 +51,38 @@ export function videoStreamToConfig(t) {
   } else if (t.family === "vp8") {
     ret.codec = "vp8";
   } else if (t.family === "vp9") {
-    const p = t.profile == null || t.profile < 0 ? 0 : t.profile;
-    ret.codec = `vp09.0${p}.10.08`;
+    // vpcC (MP4) : profil/niveau/profondeur réels, sinon défauts P0/L10/8b
+    // (level 0 = non spécifié, fréquent via ffmpeg).
+    const VP9_LV = [10, 11, 20, 21, 30, 31, 40, 41, 50, 51, 60, 61];
+    let p = t.profile == null || t.profile < 0 ? 0 : t.profile;
+    let lv = 10, dd = 8;
+    if (e && e.length >= 4 && e[0] === 1) {
+      if (e[1] <= 3) p = e[1];
+      if (VP9_LV.includes(e[2])) lv = e[2];
+      const bd = e[3] >> 4;
+      if (bd === 10 || bd === 12) dd = bd;
+    }
+    const p2 = (n) => String(n).padStart(2, "0");
+    ret.codec = `vp09.0${p}.${p2(lv)}.0${dd}`;
   } else if (t.family === "av1") {
-    ret.codec = "av01.0.05M.08";
+    // av1C : profil/niveau/tier/profondeur réels (MP4 comme MKV : même
+    // record, marker 0x81), sinon défaut Main/4.0/8b.
+    let p = 0, lv = "40", tier = "M", dd = "08";
+    if (e && e.length >= 3 && (e[0] & 0x7f) === 1) {
+      p = (e[1] >> 5) & 0x07;
+      const li = e[1] & 0x1f;
+      const LV = ["20","21","22","23","30","31","40","41","42","43","50","51","52","53","60","61","62","63","70","71","72","73"];
+      if (li < LV.length) lv = LV[li];
+      tier = (e[2] & 0x80) ? "H" : "M";
+      dd = (e[2] & 0x20) ? "12" : (e[2] & 0x40) ? "10" : "08";
+    }
+    ret.codec = `av01.${p}.${lv}${tier}.${dd}`;
   }
-  if (verbatimDesc && (t.family === "h264" || t.family === "hevc")) ret.description = verbatimDesc;
+  // AV1 EXIGE sa description (av1C) ; VP9 s'en passe (bitstream
+  // auto-décrit — vpcC non joint même si présent).
+  if (verbatimDesc && (t.family === "h264" || t.family === "hevc" || t.family === "av1")) {
+    ret.description = verbatimDesc;
+  }
   return ret;
 }
 

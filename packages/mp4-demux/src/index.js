@@ -37,6 +37,16 @@ function avcProfileLevel(avcC) {
   if (!avcC || avcC.length < 4 || avcC[0] !== 1) return { profile: -1, level: -1 };
   return { profile: avcC[1] | ((avcC[2] & 0x40) ? 0x100 : 0), level: avcC[3] };
 }
+// AV1CodecConfigurationRecord → { profile, level } (level = idx×10+20 : 2.0=20…).
+function av1ProfileLevel(av1C) {
+  if (!av1C || av1C.length < 3 || (av1C[0] & 0x7f) !== 1) return { profile: -1, level: -1 };
+  return { profile: (av1C[1] >> 5) & 0x07, level: 20 + (av1C[1] & 0x1f) };
+}
+// VP9CodecConfigurationRecord v1 → { profile, level }.
+function vp9ProfileLevel(vpcC) {
+  if (!vpcC || vpcC.length < 5 || vpcC[0] !== 1) return { profile: -1, level: -1 };
+  return { profile: vpcC[1], level: vpcC[2] };
+}
 function aacProfile(asc) {
   if (!asc || !asc.length) return -1;
   const aot = asc[0] >> 3;
@@ -170,6 +180,16 @@ export async function openMp4(source) {
     } else if (t.family === "hevc" && B.has("hvcC")) {
       t.codecPrivate = Uint8Array.from(B.get("hvcC"));
       t.extradata = t.codecPrivate;
+    } else if (t.family === "av1" && B.has("av1C")) {
+      t.codecPrivate = Uint8Array.from(B.get("av1C"));
+      t.extradata = t.codecPrivate;
+      const pl = av1ProfileLevel(t.codecPrivate);
+      t.profile = pl.profile; t.level = pl.level;
+    } else if (t.family === "vp9" && B.has("vpcC")) {
+      t.codecPrivate = Uint8Array.from(B.get("vpcC"));
+      t.extradata = t.codecPrivate;
+      const pl = vp9ProfileLevel(t.codecPrivate);
+      t.profile = pl.profile; t.level = pl.level;
     } else if (t.family === "aac") {
       const esds = B.get("esds");
       if (esds) {
@@ -187,6 +207,9 @@ export async function openMp4(source) {
     } else if (t.family === "opus" && B.has("dOps")) {
       t.codecPrivate = Uint8Array.from(B.get("dOps"));
       t.extradata = t.codecPrivate;
+      // dOps : champs LE comme OpusHead (RFC 7845) → preskip à +2.
+      const d = t.codecPrivate;
+      t._opusPreskip = d.length >= 4 ? (d[2] | (d[3] << 8)) : 0;
     } else if (t.family === "flac" && B.has("dfLa")) {
       t.codecPrivate = Uint8Array.from(B.get("dfLa"));
       t.extradata = t.codecPrivate;
@@ -269,9 +292,14 @@ export async function readMp4(session, lib, name, opts = {}) {
     }
     if (!data || data.length < s.size) return { res: -11, eof: false, byIdx };
     const tb = t.timescale;
+    // Opus : pre-skip conteneur (toujours @48kHz interne) retranché, clampé
+    // à 0 (même motif que le delay LAME ; le player compare des horloges).
+    // Autres pistes : timestamps bruts (edit lists → négatifs possibles).
+    const opsh = t._opusPreskip ? Number((BigInt(t._opusPreskip) * 1000000000n) / 48000n) : 0;
+    const pts = opsh ? Math.max(0, nsOf(s.pts, tb) - opsh) : nsOf(s.pts, tb);
     (byIdx[t.index] = byIdx[t.index] ?? []).push({
-      pts: nsOf(s.pts, tb),
-      dts: nsOf(s.dts, tb),
+      pts,
+      dts: opsh ? pts : nsOf(s.dts, tb),
       size: data.length,
       data,
       time_base_num: 1,
