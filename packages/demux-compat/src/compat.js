@@ -47,6 +47,7 @@ function mapCodec(codecId, kind) {
   if (c.startsWith("A_VORBIS")) return A("vorbis", 86021);
   if (c.startsWith("A_FLAC")) return A("flac", 86028);
   if (c.startsWith("A_PCM")) return A("pcm", 65536);
+  if (c.startsWith("A_MLP")) return A("truehd", 86060); // MLP brut : même décodeur
   if (c.startsWith("S_TEXT/UTF8")) return S("srt", 94225);
   if (c.startsWith("S_TEXT/ASS")) return S("ass", 94226);
   if (c.startsWith("S_HDMV/PGS")) return S("pgs", 94227);
@@ -408,6 +409,13 @@ export async function ff_init_demuxer_file(lib, name) {
       t.profile = pl.profile; t.level = pl.level;
     }
     if (m.family === "aac") t.audioProfile = aacProfile(priv);
+    if (m.family === "pcm") {
+      // Profondeur : BitDepth MKV (0 = absent → le pont refusera, propre).
+      t.bitsPerSample = Number(t.bitDepth ?? 0);
+      // A_PCM/FLOAT/IEEE = flottant (LE, vérifié) ; …/INT/BIG = big-endian.
+      t.isFloat = t.codecId.startsWith("A_PCM/FLOAT");
+      t.isBigEndian = t.codecId.includes("/BIG");
+    }
     if (m.family === "opus" && priv.length >= 12 &&
         priv[0] === 0x4f && priv[1] === 0x70 && priv[2] === 0x75 && priv[3] === 0x73) {
       // OpusHead ("OpusHead", LE) : pre-skip à +10, @48kHz interne.
@@ -476,6 +484,7 @@ export async function ff_copyout_codecpar(track) {
     extradata: priv,
     bitsPerSample: Number(track.bitsPerSample ?? 0),
     isFloat: !!track.isFloat,
+    isBigEndian: !!track.isBigEndian,
   };
 }
 
@@ -984,6 +993,7 @@ export async function ff_init_decoder(codec_id, codecpar) {
         sampleRate: Number(cp.sample_rate ?? cp.sampleRate ?? 0),
         bits: Number(cp.bitsPerSample ?? 0),
         isFloat: !!cp.isFloat,
+        isBigEndian: !!cp.isBigEndian,
       });
       console.log("[sw-dec] pont PCM logiciel activé");
       return [null, ctx, {}, {}];

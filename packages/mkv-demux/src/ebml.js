@@ -48,7 +48,7 @@ export const ID = {
   TrackType: 0x83, FlagDefault: 0x88, FlagForced: 0x55aa, DefaultDuration: 0x23e383,
   CodecID: 0x86, CodecPrivate: 0x63a2, Language: 0x22b59c, Name: 0x536e,
   Video: 0xe0, PixelWidth: 0xb0, PixelHeight: 0xba,
-  Audio: 0xe1, SamplingFreq: 0xb5, Channels: 0x9f,
+  Audio: 0xe1, SamplingFreq: 0xb5, Channels: 0x9f, BitDepth: 0x6264,
   Cluster: 0x1f43b675, Timecode: 0xe7, SimpleBlock: 0xa3, BlockGroup: 0xa0,
   Block: 0xa1, BlockDuration: 0x9b, ReferenceBlock: 0xfb,
   Cues: 0x1c53bb6b, CuePoint: 0xbb, CueTime: 0xb3, CueTrackPositions: 0xb7,
@@ -77,7 +77,8 @@ function parseEntry(r, end) {
   const t = {
     number: 0n, uid: 0n, kind: 0, default: false, forced: false,
     codecId: "", lang: "eng", name: "", defaultDurationNs: 0n,
-    width: 0n, height: 0n, channels: 0n, sampleRate: 0, codecPrivate: new Uint8Array(0),
+    width: 0n, height: 0n, channels: 0n, sampleRate: 0, bitDepth: 0n,
+    codecPrivate: new Uint8Array(0),
   };
   while (r.p < end) {
     const { id, size } = r.elem();
@@ -107,6 +108,7 @@ function parseEntry(r, end) {
           const e = r.elem(); const nn = e.size ?? 0n;
           if (e.id === ID.Channels) t.channels = r.uint(nn);
           else if (e.id === ID.SamplingFreq) t.sampleRate = r.float(nn);
+          else if (e.id === ID.BitDepth) t.bitDepth = r.uint(nn);
           else r.skip(nn);
         }
         break;

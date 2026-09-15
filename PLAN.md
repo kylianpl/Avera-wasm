@@ -234,8 +234,7 @@ MJPEG jouables (MKV VFW et MP4-mp4v inclus gratis).
 - Validé navigateur : ts-mpeg2 (SW vidéo + MP2-via-"mp3", seek OK),
   mkv DTS-HD MA 4ch (SW audio, seek delta 0, zéro erreur).
 
-### SW TrueHD — FAIT (suite 86/86 ✔, dont 4 TrueHD)
-- `packages/sw-decode/vendor/truehd/` : build decode-only `truehd`
+### SW TrueHD — FAIT (suite 86/86 ✔, dont 4 TrueHD)- `packages/sw-decode/vendor/truehd/` : build decode-only `truehd`
   FFmpeg 8.1.2 (355 Ko, même recette). `TRUEHDSession` (forme
   `DCASession`, units 40 éch. @48kHz). Pont accepte FLTP + S32P + S32
   packé (le MLP sort en S32 — trouvé par instrumentation du format,
@@ -250,3 +249,24 @@ MJPEG jouables (MKV VFW et MP4-mp4v inclus gratis).
 - Validé navigateur : .mka (horloge audio, seek delta 0) + jellyfish
   4K complet (HEVC SW + TrueHD SW : joue, drops sous charge CPU —
   attendu en double-SW 4K/140 Mbps).
+
+### PCM : BitDepth, big-endian, flottants + matrice (suite 89/89 ✔)
+Motivé par `/nightmare2.mkv` (fichier torture : h264 1080p + 61 pistes
+audio — PCM LE/BE 8→32 bits et flottants, MS/ACM, AAC/AC3/EAC3,
+MP2/MP3, Vorbis, Opus, FLAC, ALAC, TTA, WavPack, DTS, TrueHD, MLP).
+Trouvé : `BitDepth` MKV (0x6264) n'était pas parsé → bits=0 → TOUT le
+PCM MKV refusé par le pont ("profondeur inconnue"). Corrigé + pont
+étendu : A_PCM/INT/BIG (BE 16/24/32, corruption silencieuse sinon),
+A_PCM/FLOAT/IEEE = flottant LE (vérifié), A_MLP → truehd (même
+décodeur ; le MLP exotique du fichier exige FFmpeg > 8.1.2 — échec
+propre avec le message FFmpeg, écart de version documenté).
+- Vérifié : les 31 pistes PCM du fichier décodent bit-exact (diff 0.0)
+  vs natif ; les autres codecs supportés jouent (aac→truehd).
+- Fixture commitée : mkv-pcm-matrix.mkv (9 variantes, 1s) +
+  tests/pcm-matrix.test.mjs (bits/BE/flottant + sinus 440Hz > 0.9999,
+  0.99 en u8 — bruit de quantification ; codec id 0 → échec propre).
+- Non supportés (niches, `codec_0` + échec propre) : MS/ACM (Windows),
+  ALAC, TTA, WavPack.
+- Validé navigateur : matrice (9 pistes listées, lecture + seek OK) +
+  nightmare2 complet (vidéo + audio par défaut jusqu'au bout 00:05,
+  zéro erreur).
