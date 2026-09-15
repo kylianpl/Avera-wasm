@@ -1,5 +1,6 @@
 // app/demux-worker.js — Slice 2 Phase 3 : démux isolé.
-// Possède CompatLib + I/O HTTP Range + position de lecture. Parle au decode
+// Possède CompatLib + I/O HTTP (Range par bloc + prélecture séquentielle en
+// stream) + position de lecture. Parle au decode
 // worker en RPC (open/read/seek/close) sur MessagePort, paquets transférables.
 // Aucune décision de présentation/décodage ici : producteur bête et méchant.
 import { CompatLib } from "../packages/demux-compat/src/compat.js";
@@ -19,6 +20,145 @@ let generation = 0;
 let abort = null;
 let rangePromises = new Map();
 let port = null;
+
+// Prélecture séquentielle (Streams API, opportuniste) : pendant la lecture
+// le démuxeur avance de façon monotone, donc un GET ouvert (Range `N-`)
+// débite les blocs suivants en un seul aller-retour au lieu d'un RTT par
+// bloc Range. Le Range reste la source de vérité (probe, seeks, relectures,
+// repli si le stream échoue) : le stream ne fait que nourrir le même cache
+// de blocs en avance, borné par READAHEAD_BLOCKS.
+// Discipline : pause dès que l'avance suffit (backpressure naturelle — on ne
+// pull plus le reader), cancel à tout saut non séquentiel / open / close.
+const READAHEAD_BLOCKS = 8;
+let seqGen = -1;        // génération du pump actif (ou -1 : aucun)
+let seqEpoch = 0;       // incrémenté à chaque (re)démarrage/annulation
+let seqPumping = false; // un pump tourne (peut être en pause capée)
+let seqReader = null;   // reader actif (pour cancel)
+let seqNext = 0n;       // prochain offset absolu à nourrir
+let seqBaseBlock = 0;   // premier bloc couvert par le pump courant
+let demandBlock = -1;   // dernier bloc explicitement demandé (feedTrigger)
+let seqFails = 0;       // échecs stream consécutifs (repli Range pur au-delà)
+const SEQ_MAX_FAILS = 3;
+
+function seqCancel() {
+  seqEpoch++;
+  seqPumping = false;
+  try { seqReader?.cancel(); } catch {}
+  seqReader = null;
+}
+
+async function seqPump(fromOff, gen, epoch) {
+  seqPumping = true;
+  seqReader = null;
+  try {
+    const size = lib.vfs.get(sourceName)?.size ?? 0n;
+    if (fromOff >= size) return;
+    const resp = await fetch(url, {
+      headers: { Range: `bytes=${fromOff}-` },
+      signal: abort?.signal,
+    });
+    if (gen !== generation || epoch !== seqEpoch) return;
+    if ((!resp.ok && resp.status !== 206) || !resp.body) {
+      if (resp.status !== 206) throw new Error(`HTTP ${resp.status} for stream ${fromOff}-`);
+      return;
+    }
+    let base = fromOff;
+    if (resp.status === 200) {
+      if (fromOff !== 0n) return; // Range ignoré : le Range par bloc couvre
+      base = 0n;
+    }
+    const reader = resp.body.getReader();
+    seqReader = reader;
+    seqNext = base;
+    seqBaseBlock = Math.floor(Number(base) / BLOCK);
+    let carry = new Uint8Array(0);
+    const push = (a, b) => {
+      const nv = new Uint8Array(a.length + b.length);
+      nv.set(a); nv.set(b, a.length);
+      return nv;
+    };
+    for (;;) {
+      if (gen !== generation || epoch !== seqEpoch) return;
+      const sizeNow = lib.vfs.get(sourceName)?.size ?? 0n;
+      // Assez d'avance : pause (le prochain trigger séquentiel reprendra).
+      if (seqNext >= BigInt(demandBlock + 1 + READAHEAD_BLOCKS) * BigInt(BLOCK) ||
+          seqNext >= sizeNow) return;
+      let rd;
+      try {
+        rd = await reader.read();
+      } catch (e) {
+        if (e?.name === "AbortError") return;
+        throw e;
+      }
+      if (gen !== generation || epoch !== seqEpoch) return;
+      if (rd.done) return;
+      if (!rd.value?.length) continue;
+      carry = push(carry, rd.value);
+      // Découpe les blocs alignés couverts par [seqNext, seqNext+carry).
+      for (;;) {
+        const blockStart = Math.floor(Number(seqNext) / BLOCK) * BLOCK;
+        const blockEnd = Math.min(blockStart + BLOCK, Number(sizeNow));
+        const haveTo = Number(seqNext) + carry.length;
+        if (haveTo < blockEnd) break; // bloc incomplet : attend la suite
+        const take = blockEnd - Number(seqNext);
+        const piece = carry.subarray(0, take);
+        carry = carry.subarray(take);
+        seqNext += BigInt(take);
+        try {
+          await lib.ff_block_reader_dev_send(sourceName, blockStart, piece);
+        } catch {}
+        if (gen !== generation || epoch !== seqEpoch) return;
+      }
+      // Garde-fou mémoire : carry ne retient qu'un reste de bloc (< 1 Mio).
+      if (carry.length > BLOCK) {
+        const blockStart = Math.floor(Number(seqNext) / BLOCK) * BLOCK;
+        const sizeNow2 = lib.vfs.get(sourceName)?.size ?? 0n;
+        const blockEnd = Math.min(blockStart + BLOCK, Number(sizeNow2));
+        const take = Math.min(carry.length, blockEnd - Number(seqNext));
+        if (take > 0) {
+          try {
+            await lib.ff_block_reader_dev_send(sourceName, blockStart, carry.subarray(0, take));
+          } catch {}
+          carry = carry.subarray(take);
+          seqNext += BigInt(take);
+        } else {
+          carry = new Uint8Array(0);
+        }
+      }
+    }
+  } catch (e) {
+    if (e?.name !== "AbortError" && gen === generation && epoch === seqEpoch) {
+      console.debug("[demux] seq stream failed:", String(e?.message ?? e));
+      seqFails++;
+    }
+  } finally {
+    if (epoch === seqEpoch) seqPumping = false;
+    if (seqReader) { try { seqReader.cancel(); } catch {} seqReader = null; }
+  }
+}
+
+function seqKick(blockStartBytes, gen) {
+  if (seqFails >= SEQ_MAX_FAILS) return; // repli Range pur pour la génération
+  // blockStartBytes est un offset octets → on raisonne en index de bloc.
+  const blockIdx = Math.floor(blockStartBytes / BLOCK);
+  demandBlock = Math.max(demandBlock, blockIdx);
+  const nextBlock = Number(seqNext / BigInt(BLOCK));
+  if (seqGen === gen && seqBaseBlock <= blockIdx && blockIdx <= nextBlock + READAHEAD_BLOCKS + 2) {
+    // Toujours dans la foulée du stream : reprend s'il était en pause capée.
+    if (!seqPumping) {
+      seqEpoch++;
+      void seqPump(seqNext, gen, seqEpoch);
+    }
+    return;
+  }
+  // Saut (seek, ouverture, grand bond) : on repart juste après le bloc demandé.
+  seqCancel();
+  seqGen = gen;
+  demandBlock = blockIdx;
+  seqEpoch++;
+  console.log(`[demux] seq stream @${blockStartBytes + BLOCK} (read-ahead)`);
+  void seqPump(BigInt(blockStartBytes) + BigInt(BLOCK), gen, seqEpoch);
+}
 
 // Sérialisation des opérations (mutex à chaîne de promesses) : sans ça, un
 // read en vol (await fetch) s'entrelace avec un seek et avance readPos au
@@ -69,6 +209,10 @@ function feedTrigger(filename, pos) {
     console.error("Range fetch failed:", e);
     lib.ff_block_reader_dev_send(sourceName, pos, null, { errorCode: -1 }).catch(() => {});
   });
+  // Read-ahead séquentiel : nourrit les blocs suivants via un stream unique.
+  // Ne change rien à la correction (le Range ci-dessus reste la source de
+  // vérité du bloc demandé) — en cas de saut, seqKick annule et repart.
+  seqKick(blockStart, gen);
 }
 
 function collectTransfer(packets) {
@@ -112,9 +256,14 @@ async function handleRpc(d) {
     switch (d.op) {
       case "open": {
         generation++;
+        // (même ordre que close : reader d'abord, abort ensuite — voir close)
+        try { await seqReader?.cancel(); } catch {}
+        seqCancel();
         abort?.abort?.();
         abort = new AbortController();
         rangePromises = new Map();
+        seqCancel();
+        seqGen = -1; seqNext = 0n; demandBlock = -1; seqFails = 0;
         url = new URL(d.url, self.location.href).href;
         const head = await fetch(url, { method: "HEAD", signal: abort.signal });
         if (!head.ok) throw new Error(`Failed to probe media: ${head.statusText}`);
@@ -166,6 +315,11 @@ async function handleRpc(d) {
       }
       case "close": {
         generation++;
+        // Ordre : d'abord le reader du stream (fin gracieuse de la réponse
+        // en vol), puis l'abort des Range (sinon l'abort mid-stream laisse
+        // un rejet non catché côté fetch).
+        try { await seqReader?.cancel(); } catch {}
+        seqCancel();
         abort?.abort?.();
         try { await lib?.unlink(sourceName); } catch {}
         lib = null; session = null; streams = [];
