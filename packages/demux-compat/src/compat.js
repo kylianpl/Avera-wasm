@@ -42,6 +42,7 @@ function mapCodec(codecId, kind) {
   if (c.startsWith("A_AC3")) return A("ac3", 86019);
   if (c.startsWith("A_EAC3")) return A("eac3", 86055);
   if (c.startsWith("A_DTS")) return A("dts", 86056);
+  if (c.startsWith("A_TRUEHD")) return A("truehd", 86060);
   if (c.startsWith("A_OPUS")) return A("opus", 86022);
   if (c.startsWith("A_VORBIS")) return A("vorbis", 86021);
   if (c.startsWith("A_FLAC")) return A("flac", 86028);
@@ -61,7 +62,7 @@ const CODEC_NAMES = {
   7: "mjpeg", 4: "h263", 14: "msmpeg4v1", 15: "msmpeg4v2", 16: "msmpeg4v3",
   27: "h264", 173: "hevc", 139: "vp8", 167: "vp9", 32797: "av1", 12: "mp4v",
   30: "theora", 86017: "mp3", 86016: "mp2", 86018: "aac", 86019: "ac3", 86055: "eac3",
-  86056: "dts",
+  86056: "dts", 86060: "truehd",
   86022: "opus", 86021: "vorbis", 86028: "flac", 65536: "pcm", 94225: "subrip", 94226: "ass",
 };
 export function avcodec_get_name(id) { return CODEC_NAMES[id] ?? `codec_${id}`; }
@@ -971,6 +972,11 @@ export async function ff_init_decoder(codec_id, codecpar) {
       console.log("[sw-dec] décodeur logiciel audio activé (WASM FFmpeg)");
       return [null, ctx, {}, {}];
     }
+    if (name === "truehd") {
+      const ctx = await SW.createTRUEHDSession(codecpar?.family ? codecpar : { ...codecpar, family: name });
+      console.log("[sw-dec] décodeur logiciel audio activé (WASM FFmpeg)");
+      return [null, ctx, {}, {}];
+    }
     if (name === "pcm") {
       const cp = codecpar ?? {};
       const ctx = await SW.createPCMSession({
@@ -1009,7 +1015,7 @@ export async function ff_init_decoder(codec_id, codecpar) {
       console.log(`[sw-dec] décodeur logiciel ${decoder} activé (WASM FFmpeg)`);
       return [null, ctx, {}, {}];
     }
-    throw new Error(`SW fallback non migré pour ${name} (Phase 4 : HEVC + (E)AC3/DTS + PCM + MPEG-4/H.263/MJPEG/MPEG-2)`);
+    throw new Error(`SW fallback non migré pour ${name} (Phase 4 : HEVC + (E)AC3/DTS/TrueHD + PCM + MPEG-4/H.263/MJPEG/MPEG-2)`);
   }
   const ctx = await SW.createHEVCSession(codecpar);
   console.log("[sw-dec] libde265 : décodage logiciel HEVC activé (WASM)");

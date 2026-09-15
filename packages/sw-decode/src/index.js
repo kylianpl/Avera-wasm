@@ -23,6 +23,7 @@ export { createPCMSession } from "./pcm.js";
 export { MP4VSession, createMP4VSession } from "./mp4v.js";
 export { MPEG2Session, createMPEG2Session } from "./mpeg2.js";
 export { DCASession, createDCASession } from "./dca.js";
+export { TRUEHDSession, createTRUEHDSession } from "./truehd.js";
 export { splitAc3Frames, ac3FrameSize, ac3FrameSamples, ac3Bsid } from "./ac3frames.js";
 
 const WASM_URL = new URL("../vendor/libde265/libde265.wasm", import.meta.url);

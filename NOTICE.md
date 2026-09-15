@@ -64,3 +64,12 @@ Même recette que `vendor/eac3` (voir `vendor/dca/BUILD.md`) ; pont C
 `bridge.c` original (slots, float entrelacé ; FLTP + S32P acceptés —
 les extensions HD sortent en s32p 24 bits, converti). Utilisé comme
 décodeur logiciel de secours DTS (WebCodecs ne l'expose pas).
+
+`packages/sw-decode/vendor/truehd/` contient `truehd.mjs`, build
+WebAssembly **decode-only** du décodeur natif `truehd` (MLP) de FFmpeg
+8.1.2 (`libavcodec` + `libavutil`, **LGPL-2.1-or-later** — source :
+https://ffmpeg.org/releases/ffmpeg-8.1.2.tar.xz, non modifiée).
+Même recette que `vendor/dca` (voir `vendor/truehd/BUILD.md`) ; pont C
+`bridge.c` original (slots, float entrelacé ; FLTP + S32P + S32 packé
+acceptés). Utilisé comme décodeur logiciel de secours TrueHD
+(WebCodecs ne l'expose pas).

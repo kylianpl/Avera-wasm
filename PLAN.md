@@ -233,3 +233,20 @@ MJPEG jouables (MKV VFW et MP4-mp4v inclus gratis).
   reprise flush), mkv-avc-dts.mkv (75v+281a DTS-HD MA, E2E SW s32p).
 - Validé navigateur : ts-mpeg2 (SW vidéo + MP2-via-"mp3", seek OK),
   mkv DTS-HD MA 4ch (SW audio, seek delta 0, zéro erreur).
+
+### SW TrueHD — FAIT (suite 86/86 ✔, dont 4 TrueHD)
+- `packages/sw-decode/vendor/truehd/` : build decode-only `truehd`
+  FFmpeg 8.1.2 (355 Ko, même recette). `TRUEHDSession` (forme
+  `DCASession`, units 40 éch. @48kHz). Pont accepte FLTP + S32P + S32
+  packé (le MLP sort en S32 — trouvé par instrumentation du format,
+  -102 = AV_SAMPLE_FMT_S32).
+- Démux MKV : `A_TRUEHD` → (truehd, 86060). Le décodeur exige le major
+  sync (0xF8726FBA, toutes les 16 units ≈ 13 ms : comme une keyframe —
+  un saut direct sur unit mineure ne sort rien ; reprise post-seek ≤
+  13 ms de silence, tests en séquentiel + flush-reprise exacts).
+- Fixtures : mka-truehd.mka (3s 6ch 48kHz stream-copée de
+  jellyfish-140-mbps-4k-uhd-hevc-10bit.mkv — le cas `codec_0` 6 voies
+  qui a motivé le support : 3599 paquets parité ffprobe, RMS natifs).
+- Validé navigateur : .mka (horloge audio, seek delta 0) + jellyfish
+  4K complet (HEVC SW + TrueHD SW : joue, drops sous charge CPU —
+  attendu en double-SW 4K/140 Mbps).
