@@ -10,3 +10,6 @@ node_modules/
 # Builds WASM (reproductibles : wasm-pack build crates/mkv-demux)
 /packages/demux-wasm/web/
 /packages/demux-wasm/nodejs/
+
+# Build Rust local (cache + binaires, non versionné)
+/target/
