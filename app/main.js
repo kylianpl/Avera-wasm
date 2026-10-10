@@ -177,6 +177,34 @@ document.addEventListener("DOMContentLoaded", async function () {
   let mediaClockStartTime = performance.now() + performance.timeOrigin;
   let mediaClockStartSeconds = 0;
   let availableStreams = null;
+  // Sous-titres : cues absolues (ns) fournies par le worker à la sélection.
+  // Le seek n'a rien à refaire (temps absolus) ; l'overlay suit getMediaTime().
+  let subtitleCues = [];
+
+  function escapeHtml(s) {
+    return String(s ?? "")
+      .replace(/&/g, "&amp;")
+      .replace(/</g, "&lt;")
+      .replace(/>/g, "&gt;")
+      .replace(/"/g, "&quot;");
+  }
+
+  function updateSubtitleOverlay(currentSeconds) {
+    const ov = document.getElementById("subtitleOverlay");
+    if (!ov) return;
+    const tNs = currentSeconds * 1e9;
+    let hit = null;
+    for (const c of subtitleCues) {
+      if (c.startNs <= tNs && tNs < c.endNs) { hit = c; break; }
+    }
+    if (!hit) {
+      if (ov.style.display !== "none") { ov.style.display = "none"; ov.innerHTML = ""; }
+      return;
+    }
+    const html = escapeHtml(hit.text).replace(/\n/g, "<br>");
+    if (ov.innerHTML !== html) ov.innerHTML = html;
+    if (ov.style.display !== "block") ov.style.display = "block";
+  }
   // Changement de source : l'horloge audio doit repartir de 0 sur le
   // (potentiellement nouveau) AudioContext. Sans ça, si initializeAudio
   // recrée le contexte (sampleRate différent : iceage 48kHz → kaguya 44.1kHz),
@@ -233,6 +261,7 @@ document.addEventListener("DOMContentLoaded", async function () {
         seconds: seekTime,
         videoTimeStart: performance.now() + performance.timeOrigin,
       });
+      updateSubtitleOverlay(seekTime); // synchro immédiate (même en pause)
     }
   });
   document.getElementById("video").addEventListener("change", async (event) => {
@@ -441,6 +470,30 @@ document.addEventListener("DOMContentLoaded", async function () {
         option.selected = stream.selected;
         audioStream.appendChild(option);
       });
+      var subtitleStream = document.getElementById("subtitleStream");
+      subtitleStream.innerHTML = "";
+      subtitleStream.onchange = (event) => {
+        worker.postMessage({
+          type: "subtitle",
+          index: parseInt(event.target.value),
+        });
+      };
+      var offOption = document.createElement("option");
+      offOption.value = -1;
+      offOption.text = "Subtitles: Off";
+      offOption.selected = true;
+      subtitleStream.appendChild(offOption);
+      e.data.availableStreams.subtitle.forEach((stream) => {
+        var option = document.createElement("option");
+        option.value = stream.index;
+        option.text = `Subtitle Stream ${stream.index} - ${stream.codec}`;
+        subtitleStream.appendChild(option);
+      });
+      subtitleCues = [];
+      updateSubtitleOverlay(getMediaTime());
+    } else if (e.data.type === "subtitleCues") {
+      subtitleCues = e.data.cues ?? [];
+      updateSubtitleOverlay(getMediaTime());
     } else if (e.data.type == "buffering") {
       document.getElementById("buffering").style.display = e.data.buffering
         ? "block"
@@ -588,6 +641,7 @@ document.addEventListener("DOMContentLoaded", async function () {
             `${(currentTime / totalTime) * 100}%`;
           document.getElementById("currentTime").textContent =
             formatTime(currentTime);
+          updateSubtitleOverlay(currentTime);
           if (currentTime >= totalTime) {
             worker.postMessage({
               type: "stop",

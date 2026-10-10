@@ -270,3 +270,30 @@ propre avec le message FFmpeg, écart de version documenté).
 - Validé navigateur : matrice (9 pistes listées, lecture + seek OK) +
   nightmare2 complet (vidéo + audio par défaut jusqu'au bout 00:05,
   zéro erreur).
+
+### Sous-titres texte — FAIT (suite 98/98 ✔, dont 4 sub-decode + 5 sub-demux)
+- `packages/sub-decode` (maison-JS, pur) : SRT verbatim (+tags), ASS
+  (`ReadOrder,…,Text`, timing du Block ; overrides `{…}` retirés,
+  `\N`→`\n`), tx3g (u16BE + texte, vide = effacement, tronqué ignoré) ;
+  jamais de HTML côté parse (échappement UI), styles/couleurs/positions
+  ignorés v1. `packetToCue` (bornes ns, null si vide/durée nulle).
+- Démux : MKV srt/ass déjà émis (vérifié) ; MP4 : pistes `text/sbtl/subt`
+  acceptées + `tx3g` → (tx3g, 94213, movtext) — le garde SUB_FOURCC
+  pré-existant renvoyait unknown (ombres : cas traité avant).
+- Plomberie : RPC `subtitles` (scan complet sur session principale +
+  save/restore readPos/curseurs MKV/MP4 — un design initial à 2e session
+  a été abandonné au profit de cette version plus simple : un seul open,
+  pas de cache dupliqué) ; decode worker décode en cues absolues (le
+  seek n'a rien à refaire) ; UI : select (+Off) + overlay
+  (pointer-events:none, échappé, `<br>`), sync RAF + immédiate au seek
+  (même en pause).
+- Transfert : paquets COPIÉS avant postMessage (vues du cache sinon :
+  même buffer 2× = batch jeté — le bug qui a cassé l'ASS ; assertion
+  buffers-uniques en test, même règle que l'A/V).
+- Fixtures : mkv-sub-srt-ass.mkv (2+2 cues), mp4-sub-tx3g.mp4 (5
+  échantillons dont vides, 2 cues — le vide final à durée 0 est masqué
+  par ffprobe, documenté).
+- Validé navigateur : SRT/ASS/tx3g affichés au bon temps, Off masque,
+  zéro erreur.
+- Limites v1 : `tx` AVI sauté, sous-titres TS/Télétexte/DVB et Kate
+  droppés, pas de style ASS.

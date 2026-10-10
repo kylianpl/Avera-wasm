@@ -27,6 +27,7 @@ const FOURCC_MAP = {
   vp08: ["vp9", 167, T_VIDEO], vp09: ["vp9", 167, T_VIDEO],
   av01: ["av1", 32797, T_VIDEO],
   "ac-3": ["ac3", 86019, T_AUDIO], "ec-3": ["eac3", 86055, T_AUDIO],
+  tx3g: ["tx3g", 94213, T_SUBTITLE], // mov_text (ffmpeg AV_CODEC_ID_MOV_TEXT)
   Opus: ["opus", 86022, T_AUDIO], opus: ["opus", 86022, T_AUDIO],
   fLaC: ["flac", 86028, T_AUDIO], flaC: ["flac", 86028, T_AUDIO],
   ".mp3": ["mp3", 86017, T_AUDIO], "mp3 ": ["mp3", 86017, T_AUDIO],
@@ -84,6 +85,7 @@ async function topLevelBoxes(source, size) {
 
 function mapEntryToCodec(entry, kind) {
   const f = entry.fourcc;
+  if (f === "tx3g") return { family: "tx3g", id: 94213, type: T_SUBTITLE };
   if (SUB_FOURCC.has(f)) return { family: "unknown", id: 0, type: T_SUBTITLE };
   const m = FOURCC_MAP[f];
   if (m) return { family: m[0], id: m[1], type: m[2] };
@@ -136,8 +138,11 @@ export async function openMp4(source) {
   const tracks = [];
   for (const tp of trakPayloads) {
     const tr = parseTrak(tp, 0, tp.length);
-    const kind = tr.hdlr === "vide" ? "video" : tr.hdlr === "soun" ? "audio" : "other";
-    if (kind !== "video" && kind !== "audio") continue; // v1 : A/V seuls
+    const kind = tr.hdlr === "vide" ? "video"
+      : tr.hdlr === "soun" ? "audio"
+      : (tr.hdlr === "text" || tr.hdlr === "sbtl" || tr.hdlr === "subt") ? "subtitle"
+      : "other";
+    if (kind !== "video" && kind !== "audio" && kind !== "subtitle") continue;
     const stbl = tr.stbl;
     if (!stbl || !stbl.stsd.length) continue;
     const entry = stbl.stsd[0];
@@ -150,7 +155,7 @@ export async function openMp4(source) {
     const t = {
       index: tracks.length,
       number: BigInt(tr.tkhd.id),
-      kind: kind === "video" ? 1 : 2,
+      kind: kind === "video" ? 1 : kind === "audio" ? 2 : 3,
       codecId: entry.fourcc,
       family: codec.family,
       ffCodecId: codec.id,

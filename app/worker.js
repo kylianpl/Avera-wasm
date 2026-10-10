@@ -1,5 +1,6 @@
 import { RingBuffer } from "./libs/ringbuf.js";
 import * as LibAVJSWebCodecs from "../packages/wc-bridge/src/bridge.js";
+import { parseSrtPacket, parseAssPacket, parseTx3gSample, packetToCue } from "../packages/sub-decode/src/index.js";
 import { LibAV } from "../packages/demux-compat/src/compat.js";
 import {
   ff_copyout_codecpar as ff_copyout_codecpar_raw,
@@ -35,6 +36,8 @@ class MediaWorker {
     this.streams = null;
     this.videoStreamIndex = -1;
     this.audioStreamIndex = -1;
+    this.subtitleStreamIndex = -1;
+    this.subtitleCues = [];
     this.packet = null;
 
     this.availableStreams = [];
@@ -230,6 +233,9 @@ class MediaWorker {
         break;
       case "changeStream":
         await this.changeStream(e.data.streamType, e.data.index);
+        break;
+      case "subtitle":
+        await this.selectSubtitle(e.data.index);
         break;
       case "stats":
         // Debug beta : compteurs instantanés (inaudible en prod).
@@ -870,6 +876,43 @@ class MediaWorker {
       this.schedulePipelinePump();
     }
     this.scheduleRenderLoop();
+  }
+
+  // Sélection sous-titres : scan complet sur session dédiée (curseurs A/V
+  // intacts), décodage en cues absolues (le seek n'a rien à refaire).
+  // Léger et sans seek : pas de buffering, pas de reset décodeurs.
+  async selectSubtitle(streamIndex) {
+    this.subtitleStreamIndex = streamIndex;
+    this.subtitleCues = [];
+    if (streamIndex === -1 || streamIndex == null) {
+      self.postMessage({ type: "subtitleCues", cues: [] });
+      return;
+    }
+    try {
+      const st = this.streams[streamIndex];
+      const family = st?.codecpar?.family ?? "";
+      const parse = family === "srt" ? parseSrtPacket
+        : family === "ass" ? parseAssPacket
+        : family === "tx3g" ? parseTx3gSample : null;
+      if (!parse) {
+        console.warn(`[sub] famille non supportée : ${family || "?"} (texte seul v1)`);
+        self.postMessage({ type: "subtitleCues", cues: [] });
+        return;
+      }
+      const r = await this.demuxCall("subtitles", { trackIdx: streamIndex });
+      const cues = [];
+      for (const p of r.packets ?? []) {
+        const c = packetToCue(p, parse(p.data));
+        if (c) cues.push(c);
+      }
+      cues.sort((a, b) => a.startNs - b.startNs);
+      this.subtitleCues = cues;
+      console.log(`[sub] piste ${streamIndex} (${family}) : ${cues.length} cues`);
+      self.postMessage({ type: "subtitleCues", cues });
+    } catch (e) {
+      console.warn("[sub] scan impossible:", e?.message ?? e);
+      self.postMessage({ type: "subtitleCues", cues: [] });
+    }
   }
 
   async cleanupAudio() {

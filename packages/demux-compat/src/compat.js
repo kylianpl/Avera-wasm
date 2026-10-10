@@ -65,6 +65,7 @@ const CODEC_NAMES = {
   30: "theora", 86017: "mp3", 86016: "mp2", 86018: "aac", 86019: "ac3", 86055: "eac3",
   86056: "dts", 86060: "truehd",
   86022: "opus", 86021: "vorbis", 86028: "flac", 65536: "pcm", 94225: "subrip", 94226: "ass",
+  94213: "movtext",
 };
 export function avcodec_get_name(id) { return CODEC_NAMES[id] ?? `codec_${id}`; }
 export function ff_error(ret) {

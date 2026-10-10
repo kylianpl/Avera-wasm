@@ -174,8 +174,8 @@ function serialized(fn) {
 
 const BLOCK = 1048576;
 
-async function fetchBlock(blockStart, fetchLen, gen) {
-  const key = `${blockStart}:${fetchLen}`;
+async function fetchBlock(deviceName, blockStart, fetchLen, gen) {
+  const key = `${deviceName}:${blockStart}:${fetchLen}`;
   if (rangePromises.has(key)) return rangePromises.get(key);
   const promise = (async () => {
     const end = blockStart + fetchLen - 1;
@@ -189,7 +189,7 @@ async function fetchBlock(blockStart, fetchLen, gen) {
     }
     let data = new Uint8Array(await response.arrayBuffer());
     if (response.status === 200) data = data.subarray(blockStart, blockStart + fetchLen);
-    await lib.ff_block_reader_dev_send(sourceName, blockStart, data);
+    await lib.ff_block_reader_dev_send(deviceName, blockStart, data);
   })().finally(() => {
     rangePromises.delete(key);
   });
@@ -198,16 +198,20 @@ async function fetchBlock(blockStart, fetchLen, gen) {
 }
 
 function feedTrigger(filename, pos) {
-  if (!lib || !String(filename).endsWith(sourceName)) return;
+  if (!lib) return;
+  // Devices connus : session A/V + session sous-titres (suffixe "-sub").
+  // (endsWith inversé interdit : "source-1-sub" ne finit PAS par "source-1"
+  // — bug vu au premier test du RPC subtitles : aucun fetch, timeout bloc.)
+  if (filename !== sourceName && filename !== `${sourceName}-sub`) return;
   const size = lib.vfs.get(sourceName)?.size ?? 0n;
   const blockStart = Math.floor(Number(pos) / BLOCK) * BLOCK;
   const fetchLen = Math.min(BLOCK, Number(BigInt(size) - BigInt(blockStart)));
   if (fetchLen <= 0) return;
   const gen = generation;
-  fetchBlock(blockStart, fetchLen, gen).catch((e) => {
+  fetchBlock(filename, blockStart, fetchLen, gen).catch((e) => {
     if (gen !== generation) return;
     console.error("Range fetch failed:", e);
-    lib.ff_block_reader_dev_send(sourceName, pos, null, { errorCode: -1 }).catch(() => {});
+    lib.ff_block_reader_dev_send(filename, pos, null, { errorCode: -1 }).catch(() => {});
   });
   // Read-ahead séquentiel : nourrit les blocs suivants via un stream unique.
   // Ne change rien à la correction (le Range ci-dessus reste la source de
@@ -311,6 +315,50 @@ async function handleRpc(d) {
         if (!session) throw new Error("not open");
         const r = await av_seek_frame(session, d.streamIdx ?? -1, BigInt(Math.floor(Number(d.ns))), 0, 1);
         reply(true, { gen: d.gen, res: r });
+        break;
+      }
+      case "subtitles": {
+        // Scan complet d'une piste sous-titres sur la session PRINCIPALE,
+        // positions sauvegardées/restaurées (MKV : readPos ; MP4 : curseurs
+        // par piste — seuls démuxeurs à émettre du texte v1). Pas de 2e
+        // session : un seul open, pas de cache dupliqué, pas de device-bis.
+        if (!session) throw new Error("not open");
+        const trackIdx = d.trackIdx;
+        if (session.kind !== "mkv" && session.kind !== "mp4") {
+          throw new Error(`sous-titres non supportés en ${session.kind} (v1 : mkv/mp4)`);
+        }
+        const saved = {
+          readPos: session.readPos,
+          eof: session.eof,
+          cursors: session.tracks.map((t) => t.cursor ?? 0),
+        };
+        try {
+          session.readPos = session.firstClusterOff ?? session.readPos;
+          session.eof = false;
+          if (session.kind === "mp4") {
+            for (const t of session.tracks) t.cursor = 0;
+          }
+          const packets = [];
+          for (let guard = 0; guard < 5000; guard++) {
+            const [res, dict] = await ff_read_frame_multi(session, {}, { limit: 262144 });
+            if (res === AVERROR_EOF) break;
+            if (res < 0) throw new Error(`demux subtitles ${res}`);
+            packets.push(...(dict[trackIdx] ?? []));
+          }
+          // Copie : les paquets partagent les buffers du cache de blocs —
+          // les transférer tels quels détacherait le cache, et un même
+          // buffer 2× dans la transfer list jette le batch (vu en ASS).
+          // (même règle que l'émission audio/vidéo, cf. collectTransfer.)
+          const owned = packets.map((p) => ({ ...p, data: Uint8Array.from(p.data), size: p.data.length }));
+          console.log(`[sub] piste ${trackIdx} : ${owned.length} paquets`);
+          reply(true, { gen: d.gen, packets: owned }, collectTransfer(owned));
+        } finally {
+          session.readPos = saved.readPos;
+          session.eof = saved.eof;
+          if (session.kind === "mp4") {
+            session.tracks.forEach((t, i) => { t.cursor = saved.cursors[i] ?? 0; });
+          }
+        }
         break;
       }
       case "close": {
