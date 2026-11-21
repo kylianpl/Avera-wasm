@@ -451,10 +451,11 @@ propre avec le message FFmpeg, écart de version documenté).
 - **Gel de la vidéo après ~8 s (4K60 logiciel)** : le garde « frame > 250 ms
   de retard → jetée » supprimait *toutes* les frames quand le décodeur
   tournait à ~30 fps (tardives en hausse, `vBuf` à 0, image figée). Supprimé.
-  Le plafond mémoire jette désormais la tête si elle est en retard (on se
-  rapproche du direct) et la fin sinon. Tolérance de présentation 80 ms, et
-  présentation aussi à la sortie du décodeur (la rAF du worker est affamée
-  pendant le décodage 4K). Limite assumée : un 4K60 H.264 **décodé en
+  Le plafond mémoire jette la tête seulement si elle est **très** en retard
+  (> 500 ms), sinon la fin. Tolérance de présentation 50 ms ; une minuterie
+  coalescée présente les frames hors callback décodeur (la rAF du worker
+  peut être throttlée/arrêtée et Firefox n'aime pas transférer une frame
+  depuis le callback). Limite assumée : un 4K60 H.264 **décodé en
   logiciel** (~30 fps) ne peut pas rester en temps réel ; le son reste
   maître et la vidéo est best-effort (avertissement explicite). Pour une
   fluidité parfaite, il faut le décodage matériel ou une source plus

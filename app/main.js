@@ -273,8 +273,8 @@ document.addEventListener("DOMContentLoaded", async function () {
         `| io ${mo(d.ioBytes)}/${mo(d.sizeBytes)} Mio (${mbps} Mb/s, ${d.ioRequests ?? "?"} req)` +
         ` | demux @${mo(d.pos)} Mio · lu @${mo(d.seqNext)} Mio${d.eof ? " EOF" : ""}` +
         ` | ring ${ring}s (min ${ringMin}) refill ${st.aRefillMs ?? "?"}ms` +
-        ` | vBuf ${st.vBuf}/${st.frameMax ?? "?"} dec ${st.decQ ?? "?"}` +
-        ` | aQ ${st.aQ} | drops ${st.staleDropped} + tardives ${st.lateDropped ?? 0}` +
+        ` | vBuf ${st.vBuf}/${st.frameMax ?? "?"} dec ${st.decQ ?? "?"} (${st.decState ?? "?"})` +
+        ` | aQ ${st.aQ} | post ${st.posted} | drops ${st.staleDropped} + ${st.lateDropped ?? 0}` +
         ` | fed ${st.vFed} out ${st.vOut} | horloge périmée ${st.staleClock ?? 0}`,
     );
   }

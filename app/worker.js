@@ -1976,14 +1976,16 @@ class MediaWorker {
     );
   }
 
-  /** Profondeur du décodeur WebCodecs (4K → 4, 1080p → 12).
-   * Un décodeur profond laisse sortir ~1 s d'avance → tampon plein. */
+  /** Profondeur du décodeur WebCodecs. Un décodeur nourri au compte-gouttes
+   * se coince (observé : sortie 3/s puis plus rien à 4 de profondeur) ; il
+   * lui faut une file d'environ 1 s. Budget ~192 Mio (4K = 13,5 Mio/frame
+   * → 14 ; 1080p → 24). */
   decoderQueueMax() {
     const b = this.frameBytes();
-    if (!b) return 12;
+    if (!b) return this.DECODER_QUEUE_SIZE_MAX;
     return Math.max(
-      4,
-      Math.min(12, Math.floor((64 * 1024 * 1024) / b)),
+      8,
+      Math.min(12, Math.floor((192 * 1024 * 1024) / b)),
     );
   }
 
@@ -2005,18 +2007,29 @@ class MediaWorker {
     while (this.videoFrameBuffer.length > max) {
       let late = false;
       try {
-        late = this.videoFrameBuffer[0].timestamp < (this.currentVideoTime() * 1000) - 50000;
+        // Ne jeter la tête que si elle est très en retard (décodeur lent) :
+        // à 50 ms, on supprimait des frames utiles sur les fichiers légers.
+        late = this.videoFrameBuffer[0].timestamp < (this.currentVideoTime() * 1000) - 500000;
       } catch {}
       const f = late ? this.videoFrameBuffer.shift() : this.videoFrameBuffer.pop();
       try { f.close(); } catch {}
       this._lateDropped = (this._lateDropped ?? 0) + 1;
     }
     this.schedulePipelinePump();
-    // Présente tout de suite la nouvelle tête (la rAF du worker est affamée
-    // quand le décodeur 4K sature le thread : sans ça, ~3 fps affichés).
-    if (this.isPlaying && !this.isSeeking) {
+    this.schedulePresent();
+  }
+
+  /** Présente sans dépendre uniquement de la rAF du worker (throttlée en
+   * arrière-plan / parfois arrêtée) : une macrotâche coalescée, jamais dans le
+   * callback du décodeur (Firefox n'aime pas y transférer les frames). */
+  schedulePresent() {
+    if (this._presentScheduled || !this.isPlaying || this.isSeeking) return;
+    this._presentScheduled = true;
+    setTimeout(() => {
+      this._presentScheduled = false;
+      if (!this.isPlaying || this.isSeeking) return;
       try { this.renderVideo(); } catch {}
-    }
+    }, 0);
   }
 
   renderVideoLoop() {
@@ -2092,9 +2105,7 @@ class MediaWorker {
     // currentTime aussi : currentVideoTime() est en ms × 1000). L'ancienne
     // valeur 16.67 valait 16,67 µs, pas 16,67 ms : quasi toutes les frames
     // étaient « périmées » et jetées (flashs courts invisibles, ~50 % de drops).
-    // Tolérance en µs (80 ms : ~5 frames 60 fps). Assez large pour les
-    // rafales d'un décodeur lent, assez serré pour la synchro A/V (< 120 ms).
-    const VSYNC_INTERVAL = 80 * 1000;
+    const VSYNC_INTERVAL = 50 * 1000;
     while (
       this.videoFrameBuffer.length > 1 &&
       this.videoFrameBuffer[0].timestamp < currentTime - VSYNC_INTERVAL
