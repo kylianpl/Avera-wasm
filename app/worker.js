@@ -1995,29 +1995,28 @@ class MediaWorker {
       );
     this._vOut = (this._vOut ?? 0) + 1;
     this._lastVOutT = performance.now();
-    // Frame déjà en retard sur l'horloge (= décodeur plus lent que le temps
-    // réel) : elle serait jetée à la présentation. On la ferme tout de suite
-    // pour ne pas gonfler la mémoire ni le GC (4K = 13,5 Mio/frame).
-    if (this.isPlaying && !this.isSeeking && !this._priming) {
-      let tsMs = null;
-      try { tsMs = frame.timestamp / 1000; } catch {}
-      if (tsMs != null && this.currentVideoTime() - tsMs > 250) {
-        try { frame.close(); } catch {}
-        this._lateDropped = (this._lateDropped ?? 0) + 1;
-        return;
-      }
-    }
     this.videoFrameBuffer.push(frame);
-    // Plafond mémoire dur. On jette par la FIN (frames futures) : jeter la
-    // tête supprimait des frames pas encore présentées (flashs courts perdus,
-    // vidéo en avance de ~1 s quand le décodeur sort par rafales).
+    // Plafond mémoire. Ne JAMAIS jeter une frame en retard à l'entrée : quand
+    // le décodeur 4K logiciel tourne à ~17 fps, toutes les frames sont en
+    // retard et le drop sec gelait la vidéo pour de bon. Ici : si la tête est
+    // en retard on l'écarte (on se rapproche du direct), sinon on jette la fin
+    // (frames futures) pour préserver la tête due.
     const max = this.frameBufferMax();
     while (this.videoFrameBuffer.length > max) {
-      const f = this.videoFrameBuffer.pop();
+      let late = false;
+      try {
+        late = this.videoFrameBuffer[0].timestamp < (this.currentVideoTime() * 1000) - 50000;
+      } catch {}
+      const f = late ? this.videoFrameBuffer.shift() : this.videoFrameBuffer.pop();
       try { f.close(); } catch {}
       this._lateDropped = (this._lateDropped ?? 0) + 1;
     }
     this.schedulePipelinePump();
+    // Présente tout de suite la nouvelle tête (la rAF du worker est affamée
+    // quand le décodeur 4K sature le thread : sans ça, ~3 fps affichés).
+    if (this.isPlaying && !this.isSeeking) {
+      try { this.renderVideo(); } catch {}
+    }
   }
 
   renderVideoLoop() {
@@ -2093,7 +2092,9 @@ class MediaWorker {
     // currentTime aussi : currentVideoTime() est en ms × 1000). L'ancienne
     // valeur 16.67 valait 16,67 µs, pas 16,67 ms : quasi toutes les frames
     // étaient « périmées » et jetées (flashs courts invisibles, ~50 % de drops).
-    const VSYNC_INTERVAL = 50 * 1000;
+    // Tolérance en µs (80 ms : ~5 frames 60 fps). Assez large pour les
+    // rafales d'un décodeur lent, assez serré pour la synchro A/V (< 120 ms).
+    const VSYNC_INTERVAL = 80 * 1000;
     while (
       this.videoFrameBuffer.length > 1 &&
       this.videoFrameBuffer[0].timestamp < currentTime - VSYNC_INTERVAL

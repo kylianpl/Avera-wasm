@@ -448,3 +448,15 @@ propre avec le message FFmpeg, écart de version documenté).
   intacte) a été prototypé puis retiré : la latence RPC du démux sous
   charge 4K pouvait vider l'anneau et produire des sauts ; le chemin
   froid, fiable et ancré, est conservé.
+- **Gel de la vidéo après ~8 s (4K60 logiciel)** : le garde « frame > 250 ms
+  de retard → jetée » supprimait *toutes* les frames quand le décodeur
+  tournait à ~30 fps (tardives en hausse, `vBuf` à 0, image figée). Supprimé.
+  Le plafond mémoire jette désormais la tête si elle est en retard (on se
+  rapproche du direct) et la fin sinon. Tolérance de présentation 80 ms, et
+  présentation aussi à la sortie du décodeur (la rAF du worker est affamée
+  pendant le décodage 4K). Limite assumée : un 4K60 H.264 **décodé en
+  logiciel** (~30 fps) ne peut pas rester en temps réel ; le son reste
+  maître et la vidéo est best-effort (avertissement explicite). Pour une
+  fluidité parfaite, il faut le décodage matériel ou une source plus
+  légère (le pipeline n'effectue pas de saut de GOP : cela affamait
+  l'audio et n'était pas fiable).
