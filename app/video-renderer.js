@@ -89,9 +89,12 @@ class WebGLRenderer {
     }
   `;
 
-  constructor(canvas, type = "webgl2") {
+  constructor(canvas, type = "webgl2", existingCtx = null) {
     this.#canvas = canvas;
-    const gl = (this.#ctx = canvas.getContext(type));
+    // Réutilise le contexte déjà créé par la sonde : depuis Firefox 159, un
+    // second getContext() sur un OffscreenCanvas peut jeter
+    // (InvalidStateError). Un seul getContext par canvas, donc.
+    const gl = (this.#ctx = existingCtx ?? canvas.getContext(type));
 
     const vertexShader = gl.createShader(gl.VERTEX_SHADER);
     gl.shaderSource(vertexShader, WebGLRenderer.vertexShaderSource);
@@ -358,9 +361,9 @@ class Canvas2DRenderer {
   #lastWidth = 0;
   #lastHeight = 0;
 
-  constructor(canvas) {
+  constructor(canvas, existingCtx = null) {
     this.#canvas = canvas;
-    this.#ctx = canvas.getContext("2d");
+    this.#ctx = existingCtx ?? canvas.getContext("2d");
   }
 
   draw(frame) {

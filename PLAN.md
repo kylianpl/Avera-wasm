@@ -366,3 +366,21 @@ propre avec le message FFmpeg, écart de version documenté).
   son/A-V marqués `skip`, le reste validé (vidéo, seek, HDR, sous-titres,
   SW).
 - Docs : `tests/e2e/README.md` (scénarios, lancement, limites).
+
+### Firefox #2054811 (étirement VA-API H264 paddé) — RÉSOLU en amont
+- Bugzilla : **RESOLVED FIXED**, cible « 157 Branch » (dernier changement
+  2026-09-14). Firefox stable courant : 160.0.1 → plus affecté.
+- Notre contournement (décodage software forcé) ne s'active que sur
+  **Firefox Linux < 157** (`detectOldFirefoxSW`), surchargeable par `?sw=1/0`
+  ou le toggle persistant. Vérifié avec Firefox 159 (Playwright 1.65) :
+  aucun message « décodage software forcé », WebGL2 + WebCodecs OK,
+  lecture/seek/HDR/sous-titres/SW validés.
+- Firefox 159 a révélé un changement de comportement : un **second
+  `getContext()`** sur un `OffscreenCanvas` jette désormais
+  (`InvalidStateError: ... different thread`). Corrigé proprement : le
+  contexte créé par la sonde de `pickRenderer` est **réutilisé** par le
+  renderer (un seul getContext par canvas) — indépendant de la version.
+- Limite de test : le bug ne se reproduit que sur un environnement VA-API
+  (GPU) ; headless rend en software, donc la validation porte sur le
+  non-déclenchement du contournement et le rendu correct, pas sur la
+  correction interne de Firefox.

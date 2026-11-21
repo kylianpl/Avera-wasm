@@ -156,20 +156,22 @@ async function pickRenderer(c, { preferWebGL = false } = {}) {
       console.warn("WebGPU not available, falling back to WebGL:", e);
     }
   }
-  if (c.getContext("webgl2")) {
+  const gl2 = c.getContext("webgl2");
+  if (gl2) {
     console.log("Using WebGL2 renderer");
-    const r = new WebGLRenderer(c, "webgl2");
+    const r = new WebGLRenderer(c, "webgl2", gl2);
     r.kind = "webgl2";
     return r;
   }
-  if (c.getContext("webgl")) {
+  const gl1 = c.getContext("webgl");
+  if (gl1) {
     console.log("Using WebGL renderer");
-    const r = new WebGLRenderer(c, "webgl");
+    const r = new WebGLRenderer(c, "webgl", gl1);
     r.kind = "webgl";
     return r;
   }
   console.log("Falling back to Canvas2D renderer");
-  const r = new Canvas2DRenderer(c);
+  const r = new Canvas2DRenderer(c, c.getContext("2d"));
   r.kind = "2d";
   return r;
 }
