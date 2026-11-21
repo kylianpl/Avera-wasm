@@ -21,6 +21,10 @@ class AudioReaderProcessor extends AudioWorkletProcessor {
     this.deinterleaveBuffer = new Float32Array(
       this.mediaChannelCount * RENDER_QUANTUM_SIZE,
     );
+    // Diagnostic anti-flood : compte les quanta partiels et n'écrit qu'une
+    // ligne toutes les 2 s (fin de flux = famine normale).
+    this.underruns = 0;
+    this.lastWarnTime = -Infinity;
   }
 
   deinterleave(input, output) {
@@ -39,7 +43,14 @@ class AudioReaderProcessor extends AudioWorkletProcessor {
     }
     const read = this.consumerSide.pop(this.deinterleaveBuffer);
     if (read !== this.deinterleaveBuffer.length) {
-      console.warn(`[audio-worklet] partial read: got ${read}/${this.deinterleaveBuffer.length} elements`);
+      this.underruns++;
+      if (currentTime - this.lastWarnTime >= 2) {
+        console.warn(
+          `[audio-worklet] sous-alimentation : ${this.underruns} quantum(s) partiel(s) (dernier ${read}/${this.deinterleaveBuffer.length})`,
+        );
+        this.underruns = 0;
+        this.lastWarnTime = currentTime;
+      }
       const filled = Math.max(0, read);
       if (filled > 0) {
         const lastVal = this.deinterleaveBuffer[filled - 1];

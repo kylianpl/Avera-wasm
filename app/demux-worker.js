@@ -320,50 +320,6 @@ async function handleRpc(d) {
         reply(true, { gen: d.gen, res: r });
         break;
       }
-      case "subtitles": {
-        // Scan complet d'une piste sous-titres sur la session PRINCIPALE,
-        // positions sauvegardées/restaurées (MKV : readPos ; MP4 : curseurs
-        // par piste — seuls démuxeurs à émettre du texte v1). Pas de 2e
-        // session : un seul open, pas de cache dupliqué, pas de device-bis.
-        if (!session) throw new Error("not open");
-        const trackIdx = d.trackIdx;
-        if (session.kind !== "mkv" && session.kind !== "mp4") {
-          throw new Error(`sous-titres non supportés en ${session.kind} (v1 : mkv/mp4)`);
-        }
-        const saved = {
-          readPos: session.readPos,
-          eof: session.eof,
-          cursors: session.tracks.map((t) => t.cursor ?? 0),
-        };
-        try {
-          session.readPos = session.firstClusterOff ?? session.readPos;
-          session.eof = false;
-          if (session.kind === "mp4") {
-            for (const t of session.tracks) t.cursor = 0;
-          }
-          const packets = [];
-          for (let guard = 0; guard < 5000; guard++) {
-            const [res, dict] = await ff_read_frame_multi(session, {}, { limit: 262144 });
-            if (res === AVERROR_EOF) break;
-            if (res < 0) throw new Error(`demux subtitles ${res}`);
-            packets.push(...(dict[trackIdx] ?? []));
-          }
-          // Copie : les paquets partagent les buffers du cache de blocs —
-          // les transférer tels quels détacherait le cache, et un même
-          // buffer 2× dans la transfer list jette le batch (vu en ASS).
-          // (même règle que l'émission audio/vidéo, cf. collectTransfer.)
-          const owned = packets.map((p) => ({ ...p, data: Uint8Array.from(p.data), size: p.data.length }));
-          console.log(`[sub] piste ${trackIdx} : ${owned.length} paquets`);
-          reply(true, { gen: d.gen, packets: owned }, collectTransfer(owned));
-        } finally {
-          session.readPos = saved.readPos;
-          session.eof = saved.eof;
-          if (session.kind === "mp4") {
-            session.tracks.forEach((t, i) => { t.cursor = saved.cursors[i] ?? 0; });
-          }
-        }
-        break;
-      }
       case "close": {
         generation++;
         // Ordre : d'abord le reader du stream (fin gracieuse de la réponse

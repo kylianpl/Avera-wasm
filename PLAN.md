@@ -280,13 +280,16 @@ propre avec le message FFmpeg, écart de version documenté).
 - Démux : MKV srt/ass déjà émis (vérifié) ; MP4 : pistes `text/sbtl/subt`
   acceptées + `tx3g` → (tx3g, 94213, movtext) — le garde SUB_FOURCC
   pré-existant renvoyait unknown (ombres : cas traité avant).
-- Plomberie : RPC `subtitles` (scan complet sur session principale +
-  save/restore readPos/curseurs MKV/MP4 — un design initial à 2e session
-  a été abandonné au profit de cette version plus simple : un seul open,
-  pas de cache dupliqué) ; decode worker décode en cues absolues (le
-  seek n'a rien à refaire) ; UI : select (+Off) + overlay
-  (pointer-events:none, échappé, `<br>`), sync RAF + immédiate au seek
-  (même en pause).
+- Plomberie : scan dans un **worker dédié** (`app/sub-scan-worker.js`,
+  session + I/O HTTP indépendantes, pipeline 8 blocs, filtre `onlyIdx`
+  pour ne copier que la piste visée). Un scan sur la session principale
+  (RPC sérialisé) bloquait le démux pendant des secondes → ring audio
+  vidé, dérive et stall (constaté sur un épisode de 24 min). Le decode
+  worker décode en cues absolues (le seek n'a rien à refaire) ; UI :
+  select (+Off) + overlay (pointer-events:none, échappé, `<br>`), sync
+  RAF + immédiate au seek (même en pause). Scan 1,5 Go ≈ 36-41 s en
+  parallèle sans impact A/V (0 stall, 0 famine, 0 dérive, Chromium +
+  Firefox).
 - Transfert : paquets COPIÉS avant postMessage (vues du cache sinon :
   même buffer 2× = batch jeté — le bug qui a cassé l'ASS ; assertion
   buffers-uniques en test, même règle que l'A/V).

@@ -466,6 +466,11 @@ class MediaWorker {
     }
     this.formatContext = null;
     this.sourceName = null;
+    // Scan sous-titres en cours : plus rien à faire sur l'ancienne source.
+    try { this._subScan?.terminate(); } catch {}
+    this._subScan = null;
+    this._subScanToken = (this._subScanToken ?? 0) + 1;
+    this.subtitleCues = [];
   }
 
   streamTimestamp(seconds, streamIndex) {
@@ -885,31 +890,57 @@ class MediaWorker {
   async selectSubtitle(streamIndex) {
     this.subtitleStreamIndex = streamIndex;
     this.subtitleCues = [];
+    // Un scan précédent (ou un changement de piste) annule le précédent.
+    try { this._subScan?.terminate(); } catch {}
+    this._subScan = null;
     if (streamIndex === -1 || streamIndex == null) {
       self.postMessage({ type: "subtitleCues", cues: [] });
       return;
     }
+    const st = this.streams[streamIndex];
+    const family = st?.codecpar?.family ?? "";
+    const parse = family === "srt" ? parseSrtPacket
+      : family === "ass" ? parseAssPacket
+      : family === "tx3g" ? parseTx3gSample : null;
+    if (!parse) {
+      console.warn(`[sub] famille non supportée : ${family || "?"} (texte seul v1)`);
+      self.postMessage({ type: "subtitleCues", cues: [] });
+      return;
+    }
+    // Scan dans un WORKER DÉDIÉ : le démux de lecture n'est jamais bloqué
+    // (le faire ici sérialisait le mutex RPC pendant des secondes → audio
+    // affamé, dérive, stall — vu sur un épisode de 24 min).
     try {
-      const st = this.streams[streamIndex];
-      const family = st?.codecpar?.family ?? "";
-      const parse = family === "srt" ? parseSrtPacket
-        : family === "ass" ? parseAssPacket
-        : family === "tx3g" ? parseTx3gSample : null;
-      if (!parse) {
-        console.warn(`[sub] famille non supportée : ${family || "?"} (texte seul v1)`);
-        self.postMessage({ type: "subtitleCues", cues: [] });
-        return;
-      }
-      const r = await this.demuxCall("subtitles", { trackIdx: streamIndex });
-      const cues = [];
-      for (const p of r.packets ?? []) {
-        const c = packetToCue(p, parse(p.data));
-        if (c) cues.push(c);
-      }
-      cues.sort((a, b) => a.startNs - b.startNs);
-      this.subtitleCues = cues;
-      console.log(`[sub] piste ${streamIndex} (${family}) : ${cues.length} cues`);
-      self.postMessage({ type: "subtitleCues", cues });
+      const worker = new Worker(new URL("./sub-scan-worker.js", import.meta.url), { type: "module" });
+      this._subScan = worker;
+      const token = (this._subScanToken = (this._subScanToken ?? 0) + 1);
+      worker.onmessage = (e) => {
+        const d = e.data;
+        if (token !== this._subScanToken || this._subScan !== worker) return;
+        if (d?.type === "cues") {
+          const cues = [];
+          for (const p of d.packets ?? []) {
+            const c = packetToCue(p, parse(p.data));
+            if (c) cues.push(c);
+          }
+          cues.sort((a, b) => a.startNs - b.startNs);
+          this.subtitleCues = cues;
+          console.log(`[sub] piste ${streamIndex} (${family}) : ${cues.length} cues en ${d.ms} ms`);
+          self.postMessage({ type: "subtitleCues", cues });
+        } else if (d?.type === "error") {
+          console.warn("[sub] scan impossible:", d.error);
+          self.postMessage({ type: "subtitleCues", cues: [] });
+        }
+        try { worker.terminate(); } catch {}
+        if (this._subScan === worker) this._subScan = null;
+      };
+      worker.onerror = (err) => {
+        console.warn("[sub] scan worker:", err?.message ?? err);
+        if (token === this._subScanToken) self.postMessage({ type: "subtitleCues", cues: [] });
+        try { worker.terminate(); } catch {}
+        if (this._subScan === worker) this._subScan = null;
+      };
+      worker.postMessage({ type: "start", url: this._openUrl, trackIdx: streamIndex });
     } catch (e) {
       console.warn("[sub] scan impossible:", e?.message ?? e);
       self.postMessage({ type: "subtitleCues", cues: [] });
@@ -1873,7 +1904,17 @@ class MediaWorker {
           await this.refillFrameQueues();
           if (ep !== this.seekSerial) return; // seek entre-temps : paquets périmés
           if (this.audioPacketQueue.length === 0) {
-            console.warn("No more audio packets available");
+            // Fin de piste ou famine : ne pas inonder la console (le pompage
+            // rappelle cette fonction en boucle).
+            const now = performance.now();
+            this._audioEmptyCount = (this._audioEmptyCount ?? 0) + 1;
+            if (now - (this._audioEmptyWarnAt ?? 0) > 2000) {
+              console.warn(
+                `No more audio packets available (${this._audioEmptyCount} fois)`,
+              );
+              this._audioEmptyWarnAt = now;
+              this._audioEmptyCount = 0;
+            }
             break;
           }
         }

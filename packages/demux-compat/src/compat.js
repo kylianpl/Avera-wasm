@@ -740,6 +740,9 @@ export async function ff_read_frame_multi(session, _packet, opts = {}) {
     return [0, r.byIdx];
   }
   const limit = BigInt(opts.limit ?? 524288);
+  // Scan d'une seule piste (sous-titres) : on parse tout mais on ne COPIE
+  // que les frames demandées. Sur 1,5 Go, copier vidéo+audio dominait le coût.
+  const onlyIdx = opts.onlyIdx == null ? null : Number(opts.onlyIdx);
   const byIdx = {};
   if (session.eof) return [-541478725, byIdx];
   const { lib, name } = session;
@@ -795,7 +798,7 @@ export async function ff_read_frame_multi(session, _packet, opts = {}) {
             full.set(win.subarray(s0));
             full.set(tail, win.length - s0);
             const { blocks } = parseClusterPayload(session, full.subarray(hlen), abs0 + BigInt(hlen));
-            routeBlocks(session, blocks, byIdx);
+            routeBlocks(session, blocks, byIdx, onlyIdx);
             spent += elemEnd - abs0;
             session.readPos = elemEnd;
             continue;
@@ -805,7 +808,7 @@ export async function ff_read_frame_multi(session, _packet, opts = {}) {
         }
         // Unknown-size : parse jusqu'au bout de la fenêtre (shortWindow).
         const { blocks } = parseClusterPayload(session, win.subarray(r.p), abs0 + BigInt(hlen));
-        routeBlocks(session, blocks, byIdx);
+        routeBlocks(session, blocks, byIdx, onlyIdx);
         spent += BigInt(win.length - s0);
         session.readPos = winStart + BigInt(win.length);
         r.p = win.length;
@@ -815,7 +818,7 @@ export async function ff_read_frame_multi(session, _packet, opts = {}) {
       if (e.id === ID.Cluster && elemEnd !== null && elemEnd <= winStart + BigInt(win.length)) {
         const localEnd = Number(elemEnd - winStart);
         const { blocks } = parseClusterPayload(session, win.subarray(r.p, localEnd), abs0 + BigInt(hlen));
-        routeBlocks(session, blocks, byIdx);
+        routeBlocks(session, blocks, byIdx, onlyIdx);
         spent += elemEnd - abs0;
         session.readPos = elemEnd;
         r.p = localEnd;
@@ -837,11 +840,14 @@ export async function ff_read_frame_multi(session, _packet, opts = {}) {
   }
 }
 
-function routeBlocks(session, blocks, byIdx) {
+function routeBlocks(session, blocks, byIdx, onlyIdx = null) {
   for (const { block: b, payload, durTicks } of blocks) {
     const track = session.tracks.find((t) => t.number === b.track);
     if (!track) continue;
     const idx = track.index;
+    // Filtre (scan sous-titres) : évite de COPIER chaque frame vidéo/audio
+    // (le coût dominant sur un long fichier).
+    if (onlyIdx != null && idx !== onlyIdx) continue;
     byIdx[idx] = byIdx[idx] ?? [];
     const durNs = durTicks > 0n ? durTicks * session.timecodeScale
       : (track.defaultDurationNs > 0n ? track.defaultDurationNs : 0n);
