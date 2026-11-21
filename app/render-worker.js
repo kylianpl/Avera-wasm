@@ -11,9 +11,27 @@ import {
 let renderer = null;
 let canvas = null;
 let port = null; // vers decode worker (acks)
-let drawn = 0, dropped = 0;
+let drawn = 0, replaced = 0; // replaced = frame remplacée avant ré-affichage (normal)
 // État couleur/HDR du flux courant (tone mapping côté renderer WebGL).
 let colorState = { mode: "sdr", bt2020: false, peak: 203 };
+// Capture E2E (opt-in) : image du canvas renvoyée au thread principal.
+let capture = false;
+let lastCapture = 0;
+const CAPTURE_INTERVAL = 40; // ~25 fps
+
+function maybeCapture() {
+  if (!capture || !canvas) return;
+  const now = performance.now();
+  if (now - lastCapture < CAPTURE_INTERVAL) return;
+  lastCapture = now;
+  try {
+    createImageBitmap(canvas).then((bitmap) => {
+      try {
+        self.postMessage({ type: "captureFrame", bitmap, ts: now }, [bitmap]);
+      } catch { bitmap.close?.(); }
+    }).catch(() => {});
+  } catch {}
+}
 // Image courante (transférée) : ré-affichée à chaque tick, remplacée à
 // chaque nouvelle frame, jetée sur 'clear'. Pas de file (le decode décide).
 let inflight = null;
@@ -27,6 +45,7 @@ function loop() {
   if (inflight && renderer) {
     try {
       const r = renderer.draw(inflight);
+      maybeCapture();
       if (r && typeof r.then === "function") r.catch((e) => console.error("Renderer draw error:", e));
     } catch (e) {
       console.error("Renderer draw error:", e);
@@ -60,7 +79,12 @@ self.onmessage = async (e) => {
       if (rafId !== null) { try { self.cancelAnimationFrame(rafId); } catch {} rafId = null; }
       break;
     case "stats":
-      self.postMessage({ type: "renderStats", drawn, dropped, hasFrame: !!inflight });
+      self.postMessage({ type: "renderStats", drawn, replaced, hasFrame: !!inflight });
+      break;
+    case "capture":
+      // Mode test E2E (?capture=1) : renvoie des ImageBitmap du canvas vers
+      // le thread principal pour l'enregistrement A/V (MediaRecorder).
+      capture = !!d.enabled;
       break;
     default:
       break;
@@ -74,10 +98,11 @@ async function onPortMessage(d) {
     // Nouvelle image à afficher : remplace la courante (fermée), peinte
     // aussitôt (le loop la ré-affichera ensuite à chaque tick).
     if (!renderer || !d.frame) return;
-    if (inflight) { try { inflight.close(); } catch {} dropped++; }
+    if (inflight) { try { inflight.close(); } catch {} replaced++; }
     inflight = d.frame;
     try {
       const r = renderer.draw(inflight);
+      maybeCapture();
       drawn++;
       if (r && typeof r.then === "function") {
         r.then(() => port?.postMessage({ type: "drawn" }));

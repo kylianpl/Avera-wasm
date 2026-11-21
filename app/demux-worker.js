@@ -99,8 +99,11 @@ async function seqPump(fromOff, gen, epoch) {
         const blockStart = Math.floor(Number(seqNext) / BLOCK) * BLOCK;
         const blockEnd = Math.min(blockStart + BLOCK, Number(sizeNow));
         const haveTo = Number(seqNext) + carry.length;
-        if (haveTo < blockEnd) break; // bloc incomplet : attend la suite
+        // EOF / saut au-delà de la fin : rien à découper. Sans ce garde,
+        // take ≤ 0 faisait tourner la boucle à vide (CPU 100 % → RPC gelés).
+        if (blockEnd <= Number(seqNext) || haveTo < blockEnd) break;
         const take = blockEnd - Number(seqNext);
+        if (take <= 0) break;
         const piece = carry.subarray(0, take);
         carry = carry.subarray(take);
         seqNext += BigInt(take);
@@ -115,7 +118,7 @@ async function seqPump(fromOff, gen, epoch) {
         const sizeNow2 = lib.vfs.get(sourceName)?.size ?? 0n;
         const blockEnd = Math.min(blockStart + BLOCK, Number(sizeNow2));
         const take = Math.min(carry.length, blockEnd - Number(seqNext));
-        if (take > 0) {
+        if (take > 0 && blockEnd > Number(seqNext)) {
           try {
             await lib.ff_block_reader_dev_send(sourceName, blockStart, carry.subarray(0, take));
           } catch {}

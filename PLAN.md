@@ -335,3 +335,34 @@ propre avec le message FFmpeg, écart de version documenté).
 - Limites v1 : pas de peak configurable (203 nits fixe), WebGPU/Canvas2D
   non mappés, PQ 8 bits (banding possible), mastering/CLL parsés mais
   non exploités (tone mapping statique simple).
+
+### Tests E2E navigateurs réels — FAIT (51/51 ✔ Chromium+Firefox, 2 ignorées)
+- `tests/e2e/run.mjs` : harnais Playwright (Chromium système + Firefox
+  Playwright) qui lit de vrais fichiers, **enregistre vidéo+audio**
+  (capture canvas `?capture=1` + tap audio via patch `AudioNode.connect`,
+  MediaRecorder) puis analyse avec ffprobe/ffmpeg :
+  flashs réellement affichés, période, onsets audio, **décalage A/V dans
+  l'enregistrement** (-31/-45/-4 ms sur Chromium), frames distinctes,
+  freezes > 500 ms, ratio décodé/affiché, seek + reprise, tone mapping PQ
+  (210/255 pour 100/1000 nits), sous-titres SRT/ASS, SW HEVC visible.
+- Bugs réels trouvés et corrigés par ces tests :
+  1. **Prélecture séquentielle : boucle infinie près de l'EOF**
+     (`take ≤ 0`) → CPU 100 %, worker affamé → **seek gelé** (le Range
+     masquait le bloc demandé mais le RPC ne revenait jamais). Gardes
+     `blockEnd <= seqNext` / `take <= 0`.
+  2. **`await audioContext.resume()` bloquant** quand l'audio est
+     indisponible (headless, autoplay bloqué, pas de périphérique) → la
+     boucle UI et l'envoi d'horloge ne démarraient jamais (lecteur figé
+     sous Firefox headless). `settleAudio()` (course 400 ms) partout.
+  3. **Horloge média gelée sans audio** : `getMediaTime()` retombait sur
+     `audioContext.currentTime` figé à 0 → repli horloge murale si le
+     contexte n'est pas `running`. Le lecteur joue désormais en vidéo seule
+     quand l'audio est bloqué (comportement attendu).
+  4. Métrique renderer `dropped` renommée `replaced` (un remplacement par
+     nouvelle frame est normal) ; le harnais mesure les vrais drops.
+- Fixture dédiée : `av-sync-10s.mkv` (flashs blancs + beeps 1 kHz à
+  1/4/7 s), générée par ffmpeg (drawbox/aevalsrc), 23 Ko.
+- Firefox headless : pas de sortie audio (resume pending) → contrôles
+  son/A-V marqués `skip`, le reste validé (vidéo, seek, HDR, sous-titres,
+  SW).
+- Docs : `tests/e2e/README.md` (scénarios, lancement, limites).

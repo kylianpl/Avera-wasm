@@ -40,6 +40,19 @@ function formatTime(seconds) {
   );
 }
 
+let lastWorkletGen = null; // E2E : génération du worklet courant
+
+// Un AudioContext peut rester suspendu (headless, autoplay bloqué, pas de
+// périphérique) : resume()/suspend() restent alors PENDING pour toujours.
+// On ne bloque jamais la boucle de lecture dessus (sinon plus d'horloge UI
+// ni de messages updateMediaTime : lecteur figé, vu sous Firefox headless).
+function settleAudio(promise, ms = 400) {
+  return Promise.race([
+    Promise.resolve(promise).catch(() => {}),
+    new Promise((r) => setTimeout(r, ms)),
+  ]);
+}
+
 async function initializeAudio(channelCount, sampleRate, sharedArrayBuffer) {
   if (audioContext && audioContext.sampleRate !== sampleRate) {
     console.warn(
@@ -65,7 +78,7 @@ async function initializeAudio(channelCount, sampleRate, sharedArrayBuffer) {
         latencyHint: "playback",
       });
       console.log(`[audio] suspend (initial state: ${audioContext.state})`);
-      await audioContext.suspend();
+      await settleAudio(audioContext.suspend());
     } catch (e) {
       console.error("** Error: Unable to create audio context");
       return null;
@@ -74,6 +87,7 @@ async function initializeAudio(channelCount, sampleRate, sharedArrayBuffer) {
 
   try {
     var gen = Atomics.load(audioGenerationFlag, 0);
+    lastWorkletGen = gen;
     console.log(`[audio] new AudioWorkletNode(gen=${gen}, ch=${channelCount})`);
     readerNode = new AudioWorkletNode(audioContext, "audio-reader", {
       processorOptions: {
@@ -132,7 +146,7 @@ async function stopAudio() {
   audioStreamActivated = false;
   if (audioContext) {
     console.log(`[audio] stopAudio → suspend (state: ${audioContext.state})`);
-    await audioContext.suspend();
+    await settleAudio(audioContext.suspend());
   }
 }
 async function startAudio() {
@@ -143,7 +157,7 @@ async function startAudio() {
       audioStreamActivated = true;
     }
     console.log(`[audio] startAudio → resume (state: ${audioContext.state})`);
-    await audioContext.resume();
+    await settleAudio(audioContext.resume());
   }
 }
 
@@ -171,8 +185,61 @@ document.addEventListener("DOMContentLoaded", async function () {
   renderWorker.onmessage = (e) => {
     if (e.data && e.data.type === "renderReady") {
       console.log(`[render] ready, backend=${e.data.backend}`);
+    } else if (e.data && e.data.type === "captureFrame") {
+      // Mode test E2E : recopie dans un canvas visible/enregistrable.
+      const cap = window.__capture;
+      if (!cap) { e.data.bitmap.close?.(); return; }
+      const ctx = cap.ctx;
+      if (cap.canvas.width !== e.data.bitmap.width || cap.canvas.height !== e.data.bitmap.height) {
+        cap.canvas.width = e.data.bitmap.width;
+        cap.canvas.height = e.data.bitmap.height;
+      }
+      ctx.drawImage(e.data.bitmap, 0, 0);
+      e.data.bitmap.close?.();
+      cap.frames = (cap.frames ?? 0) + 1;
     }
   };
+  // Mode capture (E2E) : activé par ?capture=1.
+  if (new URLSearchParams(location.search).get("capture") === "1") {
+    const capCanvas = document.createElement("canvas");
+    capCanvas.width = 640;
+    capCanvas.height = 360;
+    capCanvas.style.display = "none";
+    document.body.appendChild(capCanvas);
+    window.__capture = { canvas: capCanvas, ctx: capCanvas.getContext("2d"), frames: 0 };
+    renderWorker.postMessage({ type: "capture", enabled: true });
+    // Accès E2E (lecture seule) : stats worker + niveau audio au gainNode.
+    window.__e2e = {
+      worker,
+      uiState() { return { isPlaying, totalTime, time: getMediaTime(), clockStart: mediaClockStartSeconds, offset: lastOffsetMediaTime }; },
+      requestStats() {
+        worker.postMessage({ type: "stats" });
+        renderWorker.postMessage({ type: "stats" });
+      },
+      audioDebug() {
+        return { flag: audioGenerationFlag?.[0] ?? null, workletGen: lastWorkletGen, ctx: audioContext?.state };
+      },
+      audioState() {
+        return audioContext
+          ? { state: audioContext.state, time: audioContext.currentTime, rate: audioContext.sampleRate }
+          : null;
+      },
+      audioPeak() {
+        if (!audioContext || !gainNode) return null;
+        if (!window.__an) {
+          window.__an = audioContext.createAnalyser();
+          window.__an.fftSize = 2048;
+          gainNode.connect(window.__an);
+        }
+        const b = new Float32Array(window.__an.fftSize);
+        window.__an.getFloatTimeDomainData(b);
+        let m = 0;
+        for (const v of b) m = Math.max(m, Math.abs(v));
+        return m;
+      },
+    };
+    console.log("[capture] mode E2E activé");
+  }
   let isPlaying = false;
   let mediaClockStartTime = performance.now() + performance.timeOrigin;
   let mediaClockStartSeconds = 0;
@@ -596,7 +663,10 @@ document.addEventListener("DOMContentLoaded", async function () {
     });
 
   function getMediaTime() {
-    if (!audioContext) {
+    // Horloge audio seulement si le contexte tourne RÉELLEMENT : sans sortie
+    // audio (headless), autoplay bloqué ou contexte suspendu, currentTime
+    // reste figé à 0 et gèlerait tout le lecteur. Repli : horloge murale.
+    if (!audioContext || audioContext.state !== "running") {
       if (!isPlaying) return mediaClockStartSeconds;
       return mediaClockStartSeconds +
         (performance.now() + performance.timeOrigin - mediaClockStartTime) / 1000;
