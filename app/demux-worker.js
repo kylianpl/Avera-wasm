@@ -326,7 +326,18 @@ async function handleRpc(d) {
           for (const p of arr) { out.push(p); bytes += p.size ?? 0; }
         };
         while (guard++ < 12 && bytes < 2 * 1048576) {
-          const [res, dict] = await ff_read_frame_multi(session, {}, { limit: 524288 });
+          // Laisse passer les autres RPC (seek, switch audio) entre deux
+          // fenêtres : un read 4K enchaîné peut monopoliser le worker.
+          await new Promise((r) => setTimeout(r, 0));
+          const [res, dict] = await ff_read_frame_multi(session, {}, {
+            limit: 524288,
+            // MP4 : lire d'abord la piste audio demandée. Après un seek, le
+            // curseur vidéo est au keyframe (souvent plusieurs secondes avant
+            // la cible) alors que l'audio est à la cible : l'ordre par offset
+            // obligeait à lire tout le video entre les deux avant le 1er
+            // paquet audio (1-9 s de gel au changement de piste).
+            audioFirstIdx: aIdx,
+          });
           if (res === AVERROR_EOF) { eof = true; break; }
           if (res < 0) throw new Error(`demux read ${res}`);
           if (vIdx !== -1 && vIdx !== null) take(dict[vIdx] ?? [], video);

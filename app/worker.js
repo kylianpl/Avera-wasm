@@ -200,6 +200,18 @@ class MediaWorker {
         const r = await self.demuxCall("seek", { streamIdx: stream, ns: String(ts), gen: self.demuxGen });
         return r.res ?? 0;
       },
+      /** Seek sans attendre la réponse (MP4 : synchrone côté démux ; l'ordre
+       * FIFO du port garantit que les read suivants voient le curseur). */
+      avformat_seek_file_nowait(fc, stream, ts) {
+        self.demuxGen = (self.demuxGen ?? 0) + 1;
+        try {
+          self.demuxPort?.postMessage({
+            id: -1, op: "seek", gen: self.demuxGen,
+            streamIdx: stream, ns: String(ts),
+          });
+        } catch {}
+        return 0;
+      },
       async ff_copyout_codecpar(t) { return ff_copyout_codecpar_raw(t); },
       avcodec_get_name(id) { return avcodec_get_name_raw(id); },
       async ff_error(r) { return ff_error_raw(r); },
@@ -819,9 +831,9 @@ class MediaWorker {
   }
 
   async changeStream(streamType, streamIndex) {
-    console.log(`Changing ${streamType} stream to index ${streamIndex}`);
     const tSwitch = performance.now();
     const serial = ++this.seekSerial;
+    console.log(`Changing ${streamType} stream to index ${streamIndex}`);
     self.postMessage({ type: "buffering", buffering: true });
     this.isSeeking = true;
     this.cancelRenderLoop();
@@ -852,6 +864,11 @@ class MediaWorker {
     }
 
     const currentTime = this.currentVideoTime() / 1000;
+    // Fige l'horloge pendant l'opération : le décodeur logiciel (AC-3 WASM)
+    // peut mettre >1 s ; sans ça le temps mural avance et on revient en
+    // arrière à l'ancrage (saut/rejeu audible).
+    this.pausedVideoTime = currentTime * 1000;
+    this.videoTimeStart = performance.now();
 
     if (streamType === "audio") {
       this.audioStreamIndex = streamIndex;
@@ -889,13 +906,21 @@ class MediaWorker {
         this.streams[seekStream].time_base_den /
         this.streams[seekStream].time_base_num;
       let timestamp = currentTime * timebase;
-      seekRes = await this.libav.avformat_seek_file_max(
-        this.formatContext,
-        seekStream,
-        timestamp,
-        0,
-        0,
-      );
+      if (this._openCache?.kind === "mp4" && streamType === "audio") {
+        // Pas d'attente du round-trip (le démux MP4 est synchrone ; un read
+        // envoyé après ce message verra déjà le curseur). Gain ~0,3-1 s.
+        seekRes = this.libav.avformat_seek_file_nowait(
+          this.formatContext, seekStream, timestamp,
+        );
+      } else {
+        seekRes = await this.libav.avformat_seek_file_max(
+          this.formatContext,
+          seekStream,
+          timestamp,
+          0,
+          0,
+        );
+      }
       if (seekRes < 0) {
         console.error(
           "Error seeking during stream change:",
@@ -917,14 +942,30 @@ class MediaWorker {
       this.audioStreamIndex != -1
         ? this.audioPacketQueue
         : this.videoPacketQueue;
-    const hasPackets = await this.refillUntilPacketsAvailable(queue, serial);
-    if (!hasPackets || queue.length == 0) {
-      console.warn("No packets available after stream change");
-      this.isSeeking = false;
-      self.postMessage({ type: "buffering", buffering: false });
-      return;
+    let hasPackets = await this.refillUntilPacketsAvailable(queue, serial, 1500);
+    if (!hasPackets && serial === this.seekSerial) {
+      // 2e chance : le décodeur SW ou un read RPC ont pu saturer le worker.
+      hasPackets = await this.refillUntilPacketsAvailable(queue, serial, 5000);
     }
     if (serial !== this.seekSerial) return;
+    if (!hasPackets || queue.length == 0) {
+      console.warn("No packets available after stream change — reprise sans amorçage");
+      this.isSeeking = false;
+      this.audioPrerollTargetSeconds = null;
+      this.pausedVideoTime = currentTime * 1000;
+      this.videoTimeStart = performance.now();
+      self.postMessage({ type: "buffering", buffering: false });
+      self.postMessage({ type: "offsetMediaTime", mediaTime: currentTime });
+      if (this.isPlaying) {
+        this._ringMin = null;
+        this._playStartedAt = performance.now();
+        this.startAudioRefillTimer();
+        this.schedulePipelinePump();
+      }
+      this.scheduleRenderLoop();
+      console.info(`[stream] ${streamType} → ${streamIndex} échec d'amorçage (reprise)`);
+      return;
+    }
 
     // Reprise : ancrage commun (horloge vidéo, preroll audio, offset main).
     // Pour un changement AUDIO seul, on ne fait PAS de préroll vidéo : sur du

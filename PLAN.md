@@ -430,10 +430,21 @@ propre avec le message FFmpeg, écart de version documenté).
 - **Changement de piste audio** : `prerollVideoTo` ne décodait rien (le
   garde `isSeeking` le bloquait : `_priming` n'était pas armé) → 2 s de
   boucle à vide + des centaines de « called while seeking ». Corrigé
-  (`_priming` sauvegardé/restauré dans les trois boucles de priming). En
-  plus, un changement **audio seul** ne fait plus de préroll vidéo (coûteux
-  en 4K logiciel) : reprise ancrée sur `currentTime`, la vidéo se recale
-  par la présentation. Résultat mesuré : piste 1 (MP3) → 2 (AC-3 WASM)
-  prête en ~100 ms, sans gel de plusieurs secondes. Le timer de refill
-  audio est réarmé, avertissements de seek limités à 1/s, et un log
-  `[stream] audio → N prêt en X ms` résume l'opération.
+  (`_priming` sauvegardé/restauré dans les trois boucles de priming). Un
+  changement **audio seul** ne fait plus de préroll vidéo (coûteux en 4K
+  logiciel) : reprise ancrée sur `currentTime`, la vidéo se recale par la
+  présentation ; l'horloge est figée pendant l'opération (sinon retour en
+  arrière audible). Le timer de refill audio est réarmé, les
+  avertissements de seek limités à 1/s.
+- **Échec d'amorçage** (`No packets available after stream change`) : le
+  chemin d'erreur ne relançait ni le pompage ni la boucle de rendu →
+  image figée jusqu'à une pause. Il retente une lecture (5 s), puis
+  **reprend toujours** (render loop + feeds + horloge + offset) même sans
+  paquets. Les `read` MP4 servent d'abord la piste audio demandée (et non
+  tout le GOP vidéo intermédiaire) : amorçage AC-3/MP3 en général
+  < 200 ms, parfois 1-3 s quand le worker de démux est saturé par le
+  décodage 4K logiciel (le seek MP4 est envoyé sans attendre la réponse).
+  Log `[stream] audio → N prêt en X ms`. Un switch « à chaud » (vidéo
+  intacte) a été prototypé puis retiré : la latence RPC du démux sous
+  charge 4K pouvait vider l'anneau et produire des sauts ; le chemin
+  froid, fiable et ancré, est conservé.

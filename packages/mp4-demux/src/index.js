@@ -290,13 +290,40 @@ export async function readMp4(session, lib, name, opts = {}) {
   const byIdx = {};
   const tracks = session.mp4.tracks;
   let spent = 0n;
+  // Priorité audio (changement de piste / seek) : après un seek, le curseur
+  // vidéo est au keyframe (parfois plusieurs secondes avant la cible) et
+  // l'audio à la cible. L'ordre par offset impose alors de lire tout le
+  // vidéo intermédiaire avant le premier paquet audio (gel de 1-9 s).
+  // On lit d'abord ~1 s de la piste audio demandée, puis l'ordre normal.
+  const audioFirstIdx = opts.audioFirstIdx == null ? -1 : Number(opts.audioFirstIdx);
+  const AUDIO_BURST = 32;
+  let audioBurst = 0;
+  let sinceYield = 0;
+
   for (let guard = 0; guard < 400; guard++) {
+    // Céder la boucle d'événements : avec un cache chaud, les awaits sur
+    // lib.read se résolvent en microtâches et 400 échantillons 4K bloquaient
+    // le worker plusieurs secondes (RPC seek/read en attente → switch audio
+    // à 2-8 s). Un macrotask toutes les 32 lectures suffit.
+    if (++sinceYield >= 32) {
+      sinceYield = 0;
+      await new Promise((r) => setTimeout(r, 0));
+    }
     let bi = -1, boff = null;
-    for (let i = 0; i < tracks.length; i++) {
-      const t = tracks[i];
-      if (t.cursor >= t.samples.length) continue;
-      const s = t.samples[t.cursor];
-      if (bi < 0 || s.off < boff) { bi = i; boff = s.off; }
+    if (audioFirstIdx >= 0 && audioBurst < AUDIO_BURST) {
+      const ai = tracks.findIndex((t) => t.index === audioFirstIdx);
+      if (ai >= 0 && tracks[ai].cursor < tracks[ai].samples.length) {
+        bi = ai;
+        boff = tracks[ai].samples[tracks[ai].cursor].off;
+      }
+    }
+    if (bi < 0) {
+      for (let i = 0; i < tracks.length; i++) {
+        const t = tracks[i];
+        if (t.cursor >= t.samples.length) continue;
+        const s = t.samples[t.cursor];
+        if (bi < 0 || s.off < boff) { bi = i; boff = s.off; }
+      }
     }
     if (bi < 0) {
       session.readPos = session.size;
@@ -328,6 +355,7 @@ export async function readMp4(session, lib, name, opts = {}) {
       key: !!s.key,
     });
     t.cursor++;
+    if (t.index === audioFirstIdx) audioBurst++;
     spent += BigInt(data.length);
     session.readPos = s.off + BigInt(data.length);
     if (spent >= limit) return { res: 0, eof: false, byIdx };
