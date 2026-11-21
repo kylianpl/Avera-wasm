@@ -631,7 +631,12 @@ class MediaWorker {
     const targetUs = targetSeconds * 1000000;
     const start = performance.now();
     let previousFrame = null;
+    // Sans _priming, feedVideoDecoder jette tout pendant isSeeking : la boucle
+    // tournait 2 s à vide (freeze + spam) sans jamais choisir la frame.
+    const wasPriming = this._priming;
+    this._priming = true;
 
+    try {
     while (serial === this.seekSerial && performance.now() - start < 2000) {
       while (this.videoFrameBuffer.length > 0) {
         const frame = this.videoFrameBuffer[0];
@@ -664,12 +669,16 @@ class MediaWorker {
       return previousFrame.timestamp / 1000000;
     }
     return targetSeconds;
+    } finally {
+      this._priming = wasPriming;
+    }
   }
 
   async primeAudioBuffer(serial, targetSeconds = 0.45) {
     if (this.audioStreamIndex === -1 || !this.ringbuffer) return;
     // C'est le SEUL moment où on nourrit les décodeurs pendant un seek :
     // le levier _priming le permet (sinon feed* jette tout en isSeeking).
+    const wasPriming = this._priming;
     this._priming = true;
     try {
       const start = performance.now();
@@ -685,13 +694,14 @@ class MediaWorker {
         await new Promise((r) => setTimeout(r, 5));
       }
     } finally {
-      this._priming = false;
+      this._priming = wasPriming;
     }
   }
 
   async showInitialFrame() {
     if (this.videoStreamIndex === -1) return;
     const serial = this.seekSerial;
+    const wasPriming = this._priming;
     this._priming = true;
     try {
       await this.refillUntilPacketsAvailable(this.videoPacketQueue, serial, 1000);
@@ -702,7 +712,7 @@ class MediaWorker {
         await new Promise((r) => setTimeout(r, 5));
       }
     } finally {
-      this._priming = false;
+      this._priming = wasPriming;
     }
     if (this.videoFrameBuffer.length > 0) {
       this.pausedVideoTime = this.videoFrameBuffer[0].timestamp / 1000;
@@ -810,6 +820,7 @@ class MediaWorker {
 
   async changeStream(streamType, streamIndex) {
     console.log(`Changing ${streamType} stream to index ${streamIndex}`);
+    const tSwitch = performance.now();
     const serial = ++this.seekSerial;
     self.postMessage({ type: "buffering", buffering: true });
     this.isSeeking = true;
@@ -915,12 +926,18 @@ class MediaWorker {
     }
     if (serial !== this.seekSerial) return;
 
-    // Même queue de reprise qu'un seek (cf. seek()) : preroll vidéo pour
-    // choisir displayTime, puis TOUT (horloge vidéo, preroll audio, offset
-    // main) ancré dessus. Avant : pas de preroll + offsetMediaTime sur le
-    // premier paquet (secondes d'écart) = désync permanente.
-    const displayTime = await this.prerollVideoTo(currentTime, serial);
-    if (serial !== this.seekSerial) return;
+    // Reprise : ancrage commun (horloge vidéo, preroll audio, offset main).
+    // Pour un changement AUDIO seul, on ne fait PAS de préroll vidéo : sur du
+    // 4K60 en décodage logiciel, décoder le GOP jusqu'à la position coûtait
+    // plusieurs secondes de freeze (le préroll tournait même 2 s à vide avant
+    // le correctif _priming). L'audio repart à currentTime ; la vidéo re-décode
+    // depuis le keyframe et rattrape via la présentation (frames périmées
+    // jetées, l'ancienne image reste affichée entre-temps).
+    let displayTime = currentTime;
+    if (streamType !== "audio") {
+      displayTime = await this.prerollVideoTo(currentTime, serial);
+      if (serial !== this.seekSerial) return;
+    }
     this.pausedVideoTime = displayTime * 1000;
     if (this.isPlaying) {
       this.videoTimeStart = performance.now();
@@ -932,11 +949,17 @@ class MediaWorker {
     self.postMessage({ type: "buffering", buffering: false });
     self.postMessage({ type: "offsetMediaTime", mediaTime: displayTime });
 
-    // Restart decoder feeds
+    // Restart decoder feeds (cleanupAudio a arrêté le timer de refill)
     if (this.isPlaying) {
+      this._ringMin = null;
+      this._playStartedAt = performance.now();
+      this.startAudioRefillTimer();
       this.schedulePipelinePump();
     }
     this.scheduleRenderLoop();
+    console.info(
+      `[stream] ${streamType} → ${streamIndex} prêt en ${Math.round(performance.now() - tSwitch)} ms`,
+    );
   }
 
   // Sélection sous-titres : scan complet sur session dédiée (curseurs A/V
@@ -1721,10 +1744,7 @@ class MediaWorker {
   async refillFrameQueues(want = null) {
     // Video step 1/4: fill videoPacketQueue with demuxed packets
     // Audio step 1/4: fill audioPacketQueue with demuxed packets
-    if (this.isSeeking)
-      console.warn(
-        "refillFrameQueues called while seeking (from feedVideoDecoder or feedAudioDecoder)",
-      );
+    if (this.isSeeking) this._warnSeekFeed("refill");
     if (this.queueFillInProgress || this.fileEnded) {
       return;
     }
@@ -1803,10 +1823,20 @@ class MediaWorker {
     return gotPackets;
   }
 
+  /** Un seul avertissement par seconde (évite des centaines de lignes). */
+  _warnSeekFeed(what) {
+    const now = performance.now();
+    this._seekFeedWarns = this._seekFeedWarns ?? {};
+    if (now - (this._seekFeedWarns[what] ?? 0) > 1000) {
+      this._seekFeedWarns[what] = now;
+      console.warn(`feed ${what} called while seeking (jeté)`);
+    }
+  }
+
   async feedVideoDecoder() {
     // Video step 2/4: send the demuxed video packets to the video decoder
     if (this.isSeeking && !this._priming) {
-      console.warn("feedVideoDecoder called while seeking (jeté)");
+      this._warnSeekFeed("video");
       return;
     }
     if (this.videoFillInProgress) return;
@@ -2091,7 +2121,7 @@ class MediaWorker {
   async feedAudioDecoder() {
     // Audio step 2/3: send the demuxed audio packets to the audio decoder
     if (this.isSeeking && !this._priming) {
-      console.warn("feedAudioDecoder called while seeking (jeté)");
+      this._warnSeekFeed("audio");
       return;
     }
     if (this.audioFillInProgress) return;

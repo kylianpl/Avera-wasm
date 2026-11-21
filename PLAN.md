@@ -427,3 +427,13 @@ propre avec le message FFmpeg, écart de version documenté).
   anneau audio plein (min ≈ 2 s), pas de crash ; le décodage logiciel ne
   tient pas 60 fps (frames sautées, avertissement explicite) — matériel
   requis pour ce cas.
+- **Changement de piste audio** : `prerollVideoTo` ne décodait rien (le
+  garde `isSeeking` le bloquait : `_priming` n'était pas armé) → 2 s de
+  boucle à vide + des centaines de « called while seeking ». Corrigé
+  (`_priming` sauvegardé/restauré dans les trois boucles de priming). En
+  plus, un changement **audio seul** ne fait plus de préroll vidéo (coûteux
+  en 4K logiciel) : reprise ancrée sur `currentTime`, la vidéo se recale
+  par la présentation. Résultat mesuré : piste 1 (MP3) → 2 (AC-3 WASM)
+  prête en ~100 ms, sans gel de plusieurs secondes. Le timer de refill
+  audio est réarmé, avertissements de seek limités à 1/s, et un log
+  `[stream] audio → N prêt en X ms` résume l'opération.
