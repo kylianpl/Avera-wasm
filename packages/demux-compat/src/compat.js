@@ -254,6 +254,7 @@ export async function ff_init_demuxer_file(lib, name) {
       const h512 = await source.read(0n, 512);
       if (sniffTs(h512)) {
         const opened = await openTs(source);
+    opened.tracks.forEach(enrichColor);
         const session = {
           kind: "ts",
           lib, name, size: v.size, segOff: 0n, segEnd: v.size,
@@ -303,6 +304,7 @@ export async function ff_init_demuxer_file(lib, name) {
   }
   if (sniffOgg(head)) {
     const opened = await openOgg(source);
+    opened.tracks.forEach(enrichColor);
     const session = {
       kind: "ogg",
       lib, name, size: v.size, segOff: 0n, segEnd: v.size,
@@ -326,6 +328,7 @@ export async function ff_init_demuxer_file(lib, name) {
   }
   if (sniffMp4(head)) {
     const opened = await openMp4(source);
+    opened.tracks.forEach(enrichColor);
     const session = {
       kind: "mp4",
       lib, name, size: v.size, segOff: 0n, segEnd: v.size,
@@ -372,6 +375,7 @@ export async function ff_init_demuxer_file(lib, name) {
   }
   if (sniffAvi(head)) {
     const opened = await openAvi(source);
+    opened.tracks.forEach(enrichColor);
     const session = {
       kind: "avi",
       lib, name, size: v.size, segOff: 0n, segEnd: v.size,
@@ -424,6 +428,7 @@ export async function ff_init_demuxer_file(lib, name) {
     } else {
       t._opusPreskip = 0;
     }
+    enrichColor(t);
   }
   const segEnd = await findSegmentEnd(lib, name, idx, v.size);
   let chapters = [];
@@ -486,6 +491,7 @@ export async function ff_copyout_codecpar(track) {
     bitsPerSample: Number(track.bitsPerSample ?? 0),
     isFloat: !!track.isFloat,
     isBigEndian: !!track.isBigEndian,
+    color: track.color ?? null,
   };
 }
 
@@ -968,6 +974,17 @@ import { sniffWav, openWav, readWav, seekWav } from "../../wav-demux/src/index.j
 import { sniffTs, openTs, readTs, seekTs } from "../../ts-demux/src/index.js";
 import { sniffFlac, openFlac, readFlac, seekFlac } from "../../flac-demux/src/index.js";
 import { id3v2Size as flacId3Size } from "../../flac-demux/src/frames.js";
+import { colorFromExtradata, mergeColor } from "../../color-meta/src/index.js";
+
+/** Couleur/HDR d'une piste vidéo : conteneur (t.color) + VUI du bitstream
+ *  (repli). Idempotent ; sans effet sur l'audio. */
+function enrichColor(t) {
+  if (t.ffCodecType !== AVMEDIA_TYPE_VIDEO) return;
+  const vui = colorFromExtradata(t.family, t.extradata ?? t.codecPrivate);
+  const col = mergeColor(t.color, vui);
+  if (col) t.color = col;
+  else delete t.color;
+}
 
 export async function ff_init_decoder(codec_id, codecpar) {
   const name = avcodec_get_name(Number(codec_id));

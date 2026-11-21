@@ -7,6 +7,7 @@
 //
 // Entrées : pistes/paquets au format demux-compat (familles + champs bruts),
 // pas de structures FFmpeg.
+import { toWebCodecsColorSpace } from "../../color-meta/src/index.js";
 const hx = (b) => (b & 0xff).toString(16).padStart(2, "0");
 
 /** VideoDecoderConfig depuis une piste vidéo.
@@ -83,6 +84,10 @@ export function videoStreamToConfig(t) {
   if (verbatimDesc && (t.family === "h264" || t.family === "hevc" || t.family === "av1")) {
     ret.description = verbatimDesc;
   }
+  // Couleur/HDR : déclare l'espace d'après les métadonnées (conteneur +
+  // VUI). Sans ça, Chromium suppose BT.709 SDR et le rendu HDR sort gris.
+  const cs = toWebCodecsColorSpace(t.color);
+  if (cs) ret.colorSpace = cs;
   return ret;
 }
 

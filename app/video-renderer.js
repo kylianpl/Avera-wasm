@@ -6,6 +6,13 @@ class WebGLRenderer {
   #ctx = null;
   #lastWidth = 0;
   #lastHeight = 0;
+  // Tone mapping (HDR → SDR)
+  #uToneMode = null;
+  #uBt2020 = null;
+  #uPeak = null;
+  #toneMode = 0;
+  #bt2020 = 0;
+  #peak = 203;
 
   static vertexShaderSource = `
     attribute vec2 xy;
@@ -21,12 +28,64 @@ class WebGLRenderer {
   `;
 
   static fragmentShaderSource = `
+    precision highp float;
     varying highp vec2 uv;
 
     uniform sampler2D texture;
+    uniform int uToneMode;   // 0 = SDR, 1 = PQ (HDR10), 2 = HLG
+    uniform int uBt2020;     // 1 = convertir BT.2020 → BT.709
+    uniform float uPeak;     // luminance cible SDR (nits)
+
+    // ST 2084 (PQ) EOTF : code normalisé → luminance linéaire (1.0 = 10 000 nits)
+    vec3 pqEotf(vec3 e) {
+      const float m1 = 0.1593017578125;
+      const float m2 = 78.84375;
+      const float c1 = 0.8359375;
+      const float c2 = 18.8515625;
+      const float c3 = 18.6875;
+      vec3 p = pow(max(e, vec3(0.0)), vec3(1.0 / m2));
+      vec3 num = max(p - c1, vec3(0.0));
+      vec3 den = max(c2 - c3 * p, vec3(1e-6));
+      return pow(num / den, vec3(1.0 / m1));
+    }
+
+    // HLG (BT.2100) inverse OETF, approximation display-referred
+    vec3 hlgEotf(vec3 e) {
+      const float a = 0.17883277;
+      const float b = 0.28466892;
+      const float c = 0.55991073;
+      vec3 low = (e * e) / 3.0;
+      vec3 high = (exp((e - c) / a) + b) / 12.0;
+      return mix(low, high, step(vec3(0.5), e));
+    }
+
+    // BT.2020 → BT.709 en linéaire
+    vec3 bt2020To709(vec3 c) {
+      return vec3(
+        dot(c, vec3( 1.6605, -0.5876, -0.0728)),
+        dot(c, vec3(-0.1246,  1.1329, -0.0083)),
+        dot(c, vec3(-0.0182, -0.1006,  1.1187))
+      );
+    }
+
+    // Courbe filmique (Narkowicz/ACES approx.) : compresse les hautes lumières
+    vec3 aces(vec3 x) {
+      return clamp((x * (2.51 * x + 0.03)) / (x * (2.43 * x + 0.59) + 0.14), 0.0, 1.0);
+    }
 
     void main(void) {
-      gl_FragColor = texture2D(texture, uv);
+      vec3 rgb = texture2D(texture, uv).rgb;
+      if (uToneMode == 0) {
+        gl_FragColor = vec4(rgb, 1.0);
+        return;
+      }
+      vec3 lin = (uToneMode == 1)
+        ? pqEotf(rgb) * 10000.0   // nits
+        : hlgEotf(rgb) * 1000.0;  // pic nominal HLG
+      if (uBt2020 == 1) lin = bt2020To709(lin);
+      // Exposition vers la cible SDR, puis courbe filmique et encodage sRGB.
+      lin = aces(lin / max(uPeak, 1.0));
+      gl_FragColor = vec4(pow(lin, vec3(1.0 / 2.2)), 1.0);
     }
   `;
 
@@ -77,6 +136,25 @@ class WebGLRenderer {
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+    // Valeurs brutes de la frame (pas de conversion couleur implicite du
+    // navigateur) : indispensable pour que le shader voie le PQ/HLG.
+    try { gl.pixelStorei(gl.UNPACK_COLORSPACE_CONVERSION_WEBGL, gl.NONE); } catch {}
+
+    // État couleur/HDR (tone mapping dans le fragment shader).
+    this.#uToneMode = gl.getUniformLocation(shaderProgram, "uToneMode");
+    this.#uBt2020 = gl.getUniformLocation(shaderProgram, "uBt2020");
+    this.#uPeak = gl.getUniformLocation(shaderProgram, "uPeak");
+    this.#toneMode = 0;
+    this.#bt2020 = 0;
+    this.#peak = 203;
+  }
+
+  /** État couleur : { mode:'sdr'|'pq'|'hlg', bt2020:bool, peak:nits }. */
+  setColorState(state) {
+    if (!state) return;
+    this.#toneMode = state.mode === "pq" ? 1 : state.mode === "hlg" ? 2 : 0;
+    this.#bt2020 = state.bt2020 ? 1 : 0;
+    if (state.peak > 0) this.#peak = state.peak;
   }
 
   draw(frame) {
@@ -88,12 +166,15 @@ class WebGLRenderer {
     }
 
     const gl = this.#ctx;
-    const source = frame.bitmap || frame;
+    const source = frame.source || frame.bitmap || frame;
 
     // Upload the frame.
     gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, source);
 
-    // Configure and draw the frame.
+    // Configure and draw the frame (tone mapping HDR → SDR).
+    gl.uniform1i(this.#uToneMode, this.#toneMode);
+    gl.uniform1i(this.#uBt2020, this.#bt2020);
+    gl.uniform1f(this.#uPeak, this.#peak);
     gl.viewport(0, 0, gl.drawingBufferWidth, gl.drawingBufferHeight);
     gl.drawArrays(gl.TRIANGLE_FAN, 0, 4);
   }
@@ -218,7 +299,7 @@ class WebGPURenderer {
       this.#lastHeight = frame.displayHeight;
     }
 
-    const source = frame.bitmap || frame;
+    const source = frame.source || frame.bitmap || frame;
 
     const uniformBindGroup = this.#device.createBindGroup({
       layout: this.#pipeline.getBindGroupLayout(0),
@@ -289,7 +370,7 @@ class Canvas2DRenderer {
       this.#lastWidth = frame.displayWidth;
       this.#lastHeight = frame.displayHeight;
     }
-    this.#ctx.drawImage(frame.bitmap || frame, 0, 0, frame.displayWidth, frame.displayHeight);
+    this.#ctx.drawImage(frame.source || frame.bitmap || frame, 0, 0, frame.displayWidth, frame.displayHeight);
   }
 
   clear() {

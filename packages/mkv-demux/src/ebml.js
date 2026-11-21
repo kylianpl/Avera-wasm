@@ -48,6 +48,10 @@ export const ID = {
   TrackType: 0x83, FlagDefault: 0x88, FlagForced: 0x55aa, DefaultDuration: 0x23e383,
   CodecID: 0x86, CodecPrivate: 0x63a2, Language: 0x22b59c, Name: 0x536e,
   Video: 0xe0, PixelWidth: 0xb0, PixelHeight: 0xba,
+  Colour: 0x55b0, ColourMatrix: 0x55b1, ColourRange: 0x55b9,
+  ColourTransfer: 0x55ba, ColourPrimaries: 0x55bb,
+  MaxCLL: 0x55bc, MaxFALL: 0x55bd, MasteringMetadata: 0x55d0,
+  MasterLumMax: 0x55d9, MasterLumMin: 0x55da,
   Audio: 0xe1, SamplingFreq: 0xb5, Channels: 0x9f, BitDepth: 0x6264,
   Cluster: 0x1f43b675, Timecode: 0xe7, SimpleBlock: 0xa3, BlockGroup: 0xa0,
   Block: 0xa1, BlockDuration: 0x9b, ReferenceBlock: 0xfb,
@@ -100,6 +104,7 @@ function parseEntry(r, end) {
           const e = r.elem(); const nn = e.size ?? 0n;
           if (e.id === ID.PixelWidth) t.width = r.uint(nn);
           else if (e.id === ID.PixelHeight) t.height = r.uint(nn);
+          else if (e.id === ID.Colour) parseColour(r, t, de);
           else r.skip(nn);
         }
         break;
@@ -117,6 +122,46 @@ function parseEntry(r, end) {
     r.p = Math.min(de, end);
   }
   return t;
+}
+
+/** Colour (Matroska) → couleur CICP brute sur la piste (merge avec VUI
+ *  plus tard, cf. demux-compat). Tolérant : champs absents ignorés. */
+function parseColour(r, t, end) {
+  const col = (t.color = t.color ?? {});
+  while (r.p < end) {
+    const e = r.elem(); const nn = e.size ?? 0n;
+    const value = () => Number(r.uint(nn));
+    switch (e.id) {
+      case ID.ColourMatrix: col.matrix = value(); break;
+      case ID.ColourTransfer: col.transfer = value(); break;
+      case ID.ColourPrimaries: col.primaries = value(); break;
+      case ID.ColourRange: col.fullRange = value() === 2; break; // 1=broadcast, 2=full
+      case ID.MaxCLL: col.maxCLL = value(); break;
+      case ID.MaxFALL: col.maxFALL = value(); break;
+      case ID.MasteringMetadata: {
+        const m = (col.mastering = col.mastering ?? {});
+        while (r.p < end) {
+          const f = r.elem(); const fn = f.size ?? 0n;
+          const v = () => r.float(fn);
+          switch (f.id) {
+            case 0x55d1: m.rx = v(); break;
+            case 0x55d2: m.ry = v(); break;
+            case 0x55d3: m.gx = v(); break;
+            case 0x55d4: m.gy = v(); break;
+            case 0x55d5: m.bx = v(); break;
+            case 0x55d6: m.by = v(); break;
+            case 0x55d7: m.wx = v(); break;
+            case 0x55d8: m.wy = v(); break;
+            case ID.MasterLumMax: m.lumMax = v(); break;
+            case ID.MasterLumMin: m.lumMin = v(); break;
+            default: r.skip(fn); break;
+          }
+        }
+        break;
+      }
+      default: r.skip(nn); break;
+    }
+  }
 }
 
 /** Parse le payload Chapters → ChapterAtom[] {uid,startNs,endNs,title} */

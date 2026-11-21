@@ -12,6 +12,8 @@ let renderer = null;
 let canvas = null;
 let port = null; // vers decode worker (acks)
 let drawn = 0, dropped = 0;
+// État couleur/HDR du flux courant (tone mapping côté renderer WebGL).
+let colorState = { mode: "sdr", bt2020: false, peak: 203 };
 // Image courante (transférée) : ré-affichée à chaque tick, remplacée à
 // chaque nouvelle frame, jetée sur 'clear'. Pas de file (le decode décide).
 let inflight = null;
@@ -46,6 +48,7 @@ self.onmessage = async (e) => {
       // sans onmessage le port file sans être lu et les frames s'entassent.
       port.onmessage = (ev) => onPortMessage(ev.data);
       renderer = await pickRenderer(canvas);
+      if (renderer.setColorState) renderer.setColorState(colorState);
       self.postMessage({ type: "renderReady", backend: renderer?.kind ?? "?" });
       break;
     case "play":
@@ -65,7 +68,7 @@ self.onmessage = async (e) => {
 };
 
 // Frames + clear depuis le decode worker (canal dédié).
-function onPortMessage(d) {
+async function onPortMessage(d) {
   if (!d) return;
   if (d.type === "frame") {
     // Nouvelle image à afficher : remplace la courante (fermée), peinte
@@ -86,6 +89,25 @@ function onPortMessage(d) {
     }
     return;
   }
+  if (d.type === "color") {
+    // Nouvel état couleur (ouverture / changement de piste vidéo).
+    colorState = { ...colorState, ...(d.state ?? {}) };
+    const hdr = colorState.mode === "pq" || colorState.mode === "hlg";
+    if (renderer?.setColorState) {
+      renderer.setColorState(colorState);
+    } else if (hdr && renderer) {
+      // WebGPU/Canvas2D : pas de tone mapping ici → bascule WebGL (v1).
+      try { renderer.clear?.(); } catch {}
+      const next = await pickRenderer(canvas, { preferWebGL: true });
+      next.setColorState?.(colorState);
+      renderer = next;
+      console.log(`[render] HDR (${colorState.mode}) : rendu WebGL + tone mapping`);
+    }
+    if (inflight) {
+      try { renderer.draw(inflight); } catch {}
+    }
+    return;
+  }
   if (d.type === "clear") {
     // Oublie l'image (seek/track-change) SANS effacer le canvas — parité
     // avec l'origine (l'ancien pixels restent jusqu'aux prochaines frames).
@@ -94,9 +116,9 @@ function onPortMessage(d) {
   }
 }
 
-async function pickRenderer(c) {
+async function pickRenderer(c, { preferWebGL = false } = {}) {
   // Même ordre et mêmes sondes qu'AVERA d'origine (worker.js createRenderer).
-  if (typeof WebGPURenderer !== "undefined" && navigator.gpu) {
+  if (!preferWebGL && typeof WebGPURenderer !== "undefined" && navigator.gpu) {
     try {
       const adapter = await navigator.gpu.requestAdapter();
       if (adapter) {

@@ -297,3 +297,41 @@ propre avec le message FFmpeg, écart de version documenté).
   zéro erreur.
 - Limites v1 : `tx` AVI sauté, sous-titres TS/Télétexte/DVB et Kate
   droppés, pas de style ASS.
+
+### HDR → SDR (tone mapping) — FAIT (suite 106/106 ✔, dont 8 color-meta)
+- `packages/color-meta` (maison-JS, pur) : CICP (H.273) → chaînes
+  WebCodecs ; `normalizeColor`/`mergeColor` (règle : CICP 2 =
+  "unspecified" n'écrase jamais une valeur exploitable ; matrix 0 = rgb
+  conservé) ; parseurs VUI **H.264 et HEVC** (SPS → video_signal_type +
+  colour_description) — indispensables : ffmpeg n'écrit pas toujours
+  transfer/primaries dans le conteneur (ffprobe dit "unknown" alors que
+  la VUI porte PQ/BT.2020, vérifié sur les fixtures).
+- Conteneurs : MKV `Colour` (matrix/range/transfer/primaries/MaxCLL/
+  MaxFALL/MasteringMetadata) ; MP4 `colr` (nclx) + `mdcv` + `clli`.
+  Fusion conteneur > VUI, appliquée à toutes les pistes vidéo
+  (`enrichColor` dans demux-compat, y compris TS/AVI/OGG).
+- Bridge : `VideoDecoderConfig.colorSpace` déclaré (primaries/transfer/
+  matrix/fullRange) — sans ça Chromium suppose BT.709 et le HDR sort
+  gris. Exposé aussi dans `ff_copyout_codecpar` (`color`).
+- Rendering : tone mapping dans le fragment shader WebGL
+  (`video-renderer.js`) — EOTF ST.2084 (PQ) / HLG, BT.2020→BT.709 en
+  linéaire, courbe ACES/Narkowicz, encodage sRGB ; cible 203 nits ;
+  `UNPACK_COLORSPACE_CONVERSION_WEBGL=NONE`. HDR ⇒ WebGL forcé (WebGPU/
+  Canvas2D non mappés v1, documenté). Décode logiciel : la VideoFrame est
+  conservée (pas createImageBitmap) avec son `colorSpace` pour que le
+  shader voie le PQ.
+- **Bug pré-existant majeur corrigé** : les frames issues du décodage
+  logiciel (HEVC/MPEG-2/MP4V/MJPEG…) ne pouvaient JAMAIS être postées au
+  render worker (wrapper avec `close()` → DataCloneError avalé) : tout
+  SW vidéo était **noir** (l'audio/le temps avançaient). Payload aplati
+  (source/timestamp/dimensions) + transfert de la VideoFrame/ImageBitmap.
+- Validation numérique : fixture PQ à niveaux connus (gauche 100 nits,
+  droite 1000 nits) → canvas 210/255 (attendu ~204/253 ; écart = YUV
+  limited + PQ 8 bits) au lieu de 130/192 sans mapping. SDR : pas de
+  colorSpace, shader passthrough, rendu inchangé (vérifié). SW HEVC
+  re-rendu après le fix postMessage (640x360, contenu correct).
+- Fixtures : mkv-hevc-hdr10.mkv + mp4-hevc-hdr10.mp4 (métadonnées,
+  contenu SDR), mkv-hevc-hdr10-pq.mkv (niveaux PQ réels).
+- Limites v1 : pas de peak configurable (203 nits fixe), WebGPU/Canvas2D
+  non mappés, PQ 8 bits (banding possible), mastering/CLL parsés mais
+  non exploités (tone mapping statique simple).

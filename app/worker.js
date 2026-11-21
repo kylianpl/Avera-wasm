@@ -1,6 +1,7 @@
 import { RingBuffer } from "./libs/ringbuf.js";
 import * as LibAVJSWebCodecs from "../packages/wc-bridge/src/bridge.js";
 import { parseSrtPacket, parseAssPacket, parseTx3gSample, packetToCue } from "../packages/sub-decode/src/index.js";
+import { hdrMode, toWebCodecsColorSpace } from "../packages/color-meta/src/index.js";
 import { LibAV } from "../packages/demux-compat/src/compat.js";
 import {
   ff_copyout_codecpar as ff_copyout_codecpar_raw,
@@ -245,7 +246,7 @@ class MediaWorker {
           vQ: this.videoPacketQueue.length,
           vQBytes: this.PACKET_QUEUE_BYTES_VIDEO,
           vBuf: this.videoFrameBuffer.length,
-          vBuf0Ts: this.videoFrameBuffer.length ? this.videoFrameBuffer[0].timestamp : null,
+          vBuf0Ts: (() => { try { return this.videoFrameBuffer.length ? this.videoFrameBuffer[0].timestamp : null; } catch { return null; } })(),
           vClockMs: (() => { try { return Math.round(this.currentVideoTime()); } catch { return null; } })(),
           decQ: (() => { try { return this.WCVideoDecoder?.decodeQueueSize ?? null; } catch { return null; } })(),
           decState: this.WCVideoDecoder?.state ?? null,
@@ -1043,6 +1044,22 @@ class MediaWorker {
     this.postRenderClear();
   }
 
+  /** État couleur/HDR du flux vidéo courant → render worker (tone mapping).
+   *  Lu depuis codecpar.color (conteneur + VUI, cf. demux-compat). */
+  sendColorState() {
+    const c = this.streams?.[this.videoStreamIndex]?.codecpar?.color ?? null;
+    const state = {
+      mode: hdrMode(c),
+      bt2020: c?.primaries === "bt2020" || String(c?.matrix ?? "").startsWith("bt2020"),
+      peak: 203,
+      maxCLL: c?.maxCLL ?? 0,
+    };
+    try { this.renderPort?.postMessage({ type: "color", state }); } catch {}
+    if (state.mode !== "sdr") {
+      console.log(`[hdr] flux ${state.mode}${state.bt2020 ? " BT.2020" : ""} → tone mapping SDR (${state.peak} nits)`);
+    }
+  }
+
   async setupVideoDecoder() {
     this.videoUseWebCodecs = false;
     let videoConfig = await LibAVJSWebCodecs.videoStreamToConfig(
@@ -1056,6 +1073,7 @@ class MediaWorker {
       console.log("[decode] software forcé (contournement Firefox #2054811)");
     }
     this.videoConfig = videoConfig;
+    this.sendColorState();
     let webCodecsSupported = false;
     try {
       webCodecsSupported = (await VideoDecoder.isConfigSupported(videoConfig)).supported;
@@ -1229,6 +1247,13 @@ class MediaWorker {
     return this.imageDataToVideoFrame(imageData, this.frameTimestampUs(frame));
   }
 
+  /** colorSpace WebCodecs du flux vidéo courant (null si SDR/inconnu). */
+  currentVideoColor() {
+    const c = this.streams?.[this.videoStreamIndex]?.codecpar?.color ?? null;
+    if (!c || hdrMode(c) === "sdr") return null;
+    return toWebCodecsColorSpace(c);
+  }
+
   async libavFrameToVideoFrame(frame) {
     if (frame.format == null) {
       console.warn("libav frame has no format, skipping");
@@ -1293,6 +1318,7 @@ class MediaWorker {
       frame.data, l2.offset, l2.stride, uvW, uvH);
 
     const ts = this.frameTimestampUs(frame);
+    const color = this.currentVideoColor();
     const vf = new VideoFrame(cleanData, {
       format: "I420",
       codedWidth: width,
@@ -1303,7 +1329,13 @@ class MediaWorker {
         { offset: ySize, stride: uvW },
         { offset: ySize + uvSize, stride: uvW },
       ],
+      ...(color ? { colorSpace: color } : {}),
     });
+    if (color) {
+      // HDR : conserver la VideoFrame (createImageBitmap la convertirigerait
+      // en SDR 8 bits sans tone mapping) — le renderer WebGL mappe lui-même.
+      return { source: vf, timestamp: ts, displayWidth: width, displayHeight: height, close() { try { vf.close(); } catch {} } };
+    }
     const bitmap = await createImageBitmap(vf);
     vf.close();
     return { bitmap, timestamp: ts, displayWidth: width, displayHeight: height, close() { bitmap.close() } };
@@ -1327,6 +1359,7 @@ class MediaWorker {
       frame.data, l1.offset, l1.stride, uvW, uvH);
 
     const ts = this.frameTimestampUs(frame);
+    const color = this.currentVideoColor();
     const vf = new VideoFrame(cleanData, {
       format: "NV12",
       codedWidth: width,
@@ -1336,7 +1369,11 @@ class MediaWorker {
         { offset: 0, stride: width },
         { offset: ySize, stride: uvW },
       ],
+      ...(color ? { colorSpace: color } : {}),
     });
+    if (color) {
+      return { source: vf, timestamp: ts, displayWidth: width, displayHeight: height, close() { try { vf.close(); } catch {} } };
+    }
     const bitmap = await createImageBitmap(vf);
     vf.close();
     return { bitmap, timestamp: ts, displayWidth: width, displayHeight: height, close() { bitmap.close() } };
@@ -1752,7 +1789,23 @@ class MediaWorker {
     if (pts === this._lastSentPts) return;
     this._lastSentPts = pts;
     try {
-      this.renderPort.postMessage({ type: "frame", frame: head }, [head]);
+      // Payload sans fonctions : les wrappers SW portent close() (non
+      // clonable via postMessage — DataCloneError avalé = image noire pour
+      // TOUT décodage logiciel). On n'envoie que ce que le renderer utilise.
+      const source = head.source || head.bitmap || head;
+      const payload = {
+        type: "frame",
+        frame: {
+          source,
+          timestamp: head.timestamp,
+          displayWidth: head.displayWidth,
+          displayHeight: head.displayHeight,
+        },
+      };
+      const xfer = [];
+      if (typeof VideoFrame !== "undefined" && source instanceof VideoFrame) xfer.push(source);
+      else if (typeof ImageBitmap !== "undefined" && source instanceof ImageBitmap) xfer.push(source);
+      this.renderPort.postMessage(payload, xfer);
       this._posted = (this._posted ?? 0) + 1;
     } catch {
       this._lastSentPts = null;

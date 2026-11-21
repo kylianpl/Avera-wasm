@@ -16,6 +16,7 @@ import {
   parseMvhd, parseTrak, parseEsds, buildProgressiveSamples, applySingleEdit, ESDS_AUDIO,
 } from "./moov.js";
 import { parseMoof, parseMvex } from "./fmp4.js";
+import { parseColrBox, parseMdcvBox, parseClliBox } from "../../color-meta/src/index.js";
 
 // Types média (miroir demux-compat, pas d'import : cycle).
 const T_UNKNOWN = -1, T_VIDEO = 0, T_AUDIO = 1, T_SUBTITLE = 3;
@@ -177,6 +178,20 @@ export async function openMp4(source) {
     };
     // Extradata + profils (contrat bridge, comme l'enrichissement MKV).
     const B = entry.boxes;
+    // Couleur : colr/mdcv/clli (CICP brut ; la VUI du bitstream est le
+    // repli, appliqué dans demux-compat).
+    const colr = B.get("colr");
+    const mdcv = B.get("mdcv");
+    const clli = B.get("clli");
+    if (colr || mdcv || clli) {
+      t.color = {};
+      const c = colr ? parseColrBox(colr) : null;
+      if (c) Object.assign(t.color, c);
+      const m = mdcv ? parseMdcvBox(mdcv) : null;
+      if (m) t.color.mastering = m;
+      const l = clli ? parseClliBox(clli) : null;
+      if (l) Object.assign(t.color, l);
+    }
     if (t.family === "h264" && B.has("avcC")) {
       t.codecPrivate = Uint8Array.from(B.get("avcC"));
       t.extradata = t.codecPrivate;
