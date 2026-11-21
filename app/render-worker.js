@@ -57,16 +57,26 @@ function playLoop() {
   if (rafId === null && playing) rafId = self.requestAnimationFrame(loop);
 }
 
+// Largeur d'affichage (pixels physiques) : le canvas ne peint pas plus grand
+// que ce qui est visible (source 4K dans une fenêtre 1080p).
+let maxDisplayWidth = 0;
+let renderPref = ""; // "" = auto ; "webgl" | "canvas2d" | "webgpu" (?render=)
+function applyMaxWidth() {
+  try { renderer?.setMaxDisplayWidth?.(maxDisplayWidth); } catch {}
+}
+
 self.onmessage = async (e) => {
   const d = e.data;
   switch (d.type) {
     case "init":
       canvas = d.canvas;
       port = d.port;
+      renderPref = String(d.render ?? "");
       // Les frames arrivent sur le PORT (decode worker), pas sur self :
       // sans onmessage le port file sans être lu et les frames s'entassent.
       port.onmessage = (ev) => onPortMessage(ev.data);
       renderer = await pickRenderer(canvas);
+      applyMaxWidth();
       if (renderer.setColorState) renderer.setColorState(colorState);
       self.postMessage({ type: "renderReady", backend: renderer?.kind ?? "?" });
       break;
@@ -80,6 +90,10 @@ self.onmessage = async (e) => {
       break;
     case "stats":
       self.postMessage({ type: "renderStats", drawn, replaced, hasFrame: !!inflight });
+      break;
+    case "displaySize":
+      maxDisplayWidth = Math.max(0, d.width | 0);
+      applyMaxWidth();
       break;
     case "capture":
       // Mode test E2E (?capture=1) : renvoie des ImageBitmap du canvas vers
@@ -97,7 +111,12 @@ async function onPortMessage(d) {
   if (d.type === "frame") {
     // Nouvelle image à afficher : remplace la courante (fermée), peinte
     // aussitôt (le loop la ré-affichera ensuite à chaque tick).
-    if (!renderer || !d.frame) return;
+    if (!renderer || !d.frame) {
+      // Toujours acquitter : le decode worker limite les frames en vol (2).
+      try { d.frame?.close?.(); } catch {}
+      try { port?.postMessage({ type: "drawn" }); } catch {}
+      return;
+    }
     if (inflight) { try { inflight.close(); } catch {} replaced++; }
     inflight = d.frame;
     try {
@@ -111,6 +130,7 @@ async function onPortMessage(d) {
       }
     } catch (err) {
       console.error("Renderer draw error:", err);
+      try { port?.postMessage({ type: "drawn" }); } catch {}
     }
     return;
   }
@@ -126,6 +146,7 @@ async function onPortMessage(d) {
       const next = await pickRenderer(canvas, { preferWebGL: true });
       next.setColorState?.(colorState);
       renderer = next;
+      applyMaxWidth();
       console.log(`[render] HDR (${colorState.mode}) : rendu WebGL + tone mapping`);
     }
     if (inflight) {
@@ -143,7 +164,31 @@ async function onPortMessage(d) {
 
 async function pickRenderer(c, { preferWebGL = false } = {}) {
   // Même ordre et mêmes sondes qu'AVERA d'origine (worker.js createRenderer).
-  if (!preferWebGL && typeof WebGPURenderer !== "undefined" && navigator.gpu) {
+  // ?render=webgl|canvas2d : diagnostic/contournement GPU (HDR = WebGL).
+  if (!preferWebGL && renderPref === "canvas2d") {
+    console.log("Canvas2D forcé (?render=canvas2d)");
+    const r = new Canvas2DRenderer(c, c.getContext("2d"));
+    r.kind = "2d";
+    return r;
+  }
+  if (!preferWebGL && renderPref === "webgl") {
+    const g2 = c.getContext("webgl2");
+    if (g2) {
+      console.log("WebGL2 forcé (?render=webgl)");
+      const r = new WebGLRenderer(c, "webgl2", g2);
+      r.kind = "webgl2";
+      return r;
+    }
+    const g1 = c.getContext("webgl");
+    if (g1) {
+      console.log("WebGL1 forcé (?render=webgl)");
+      const r = new WebGLRenderer(c, "webgl", g1);
+      r.kind = "webgl";
+      return r;
+    }
+    console.warn("WebGL indisponible, repli automatique");
+  }
+  if (!preferWebGL && renderPref !== "canvas2d" && typeof WebGPURenderer !== "undefined" && navigator.gpu) {
     try {
       const adapter = await navigator.gpu.requestAdapter();
       if (adapter) {

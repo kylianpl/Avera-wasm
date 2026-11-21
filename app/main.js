@@ -185,6 +185,13 @@ document.addEventListener("DOMContentLoaded", async function () {
   renderWorker.onmessage = (e) => {
     if (e.data && e.data.type === "renderReady") {
       console.log(`[render] ready, backend=${e.data.backend}`);
+    } else if (e.data && e.data.type === "renderStats") {
+      window.__renderStats = e.data;
+      if (DEBUG_STATS) {
+        console.info(
+          `[render] drawn ${e.data.drawn} · remplacées ${e.data.replaced} · image ${e.data.hasFrame ? "oui" : "non"}`,
+        );
+      }
     } else if (e.data && e.data.type === "captureFrame") {
       // Mode test E2E : recopie dans un canvas visible/enregistrable.
       const cap = window.__capture;
@@ -221,7 +228,13 @@ document.addEventListener("DOMContentLoaded", async function () {
       },
       audioState() {
         return audioContext
-          ? { state: audioContext.state, time: audioContext.currentTime, rate: audioContext.sampleRate }
+          ? {
+              state: audioContext.state,
+              time: audioContext.currentTime,
+              rate: audioContext.sampleRate,
+              outputLatency: audioContext.outputLatency ?? 0,
+              baseLatency: audioContext.baseLatency ?? 0,
+            }
           : null;
       },
       audioPeak() {
@@ -240,6 +253,86 @@ document.addEventListener("DOMContentLoaded", async function () {
     };
     console.log("[capture] mode E2E activé");
   }
+  // --- Diagnostic console (toujours disponible) ---------------------------
+  // `?debug=1` : un relevé [stats] toutes les 5 s pendant la lecture.
+  // Sans flag : `await __averaDebug.stats()` pour un relevé à la demande.
+  let DEBUG_STATS = new URLSearchParams(location.search).get("debug") === "1";
+  let statsTimerId = null;
+
+  function logStatsLine(st) {
+    const d = st.demux ?? {};
+    const mo = (v) => (v == null ? "?" : (v / 1048576).toFixed(1));
+    const secs = (d.ioElapsedMs ?? 0) / 1000;
+    const mbps = d.ioBytes && secs > 0
+      ? ((d.ioBytes * 8) / secs / 1e6).toFixed(1)
+      : "?";
+    const ring = st.ringSecs == null ? "?" : st.ringSecs.toFixed(2);
+    const ringMin = st.ringMin == null ? "?" : st.ringMin.toFixed(2);
+    console.info(
+      `[stats] t=${formatTime(getMediaTime())} ` +
+        `| io ${mo(d.ioBytes)}/${mo(d.sizeBytes)} Mio (${mbps} Mb/s, ${d.ioRequests ?? "?"} req)` +
+        ` | demux @${mo(d.pos)} Mio · lu @${mo(d.seqNext)} Mio${d.eof ? " EOF" : ""}` +
+        ` | ring ${ring}s (min ${ringMin}) refill ${st.aRefillMs ?? "?"}ms` +
+        ` | vBuf ${st.vBuf}/${st.frameMax ?? "?"} dec ${st.decQ ?? "?"}` +
+        ` | aQ ${st.aQ} | drops ${st.staleDropped} + tardives ${st.lateDropped ?? 0}` +
+        ` | fed ${st.vFed} out ${st.vOut} | horloge périmée ${st.staleClock ?? 0}`,
+    );
+  }
+
+  function startStatsTimer() {
+    if (!DEBUG_STATS || statsTimerId) return;
+    statsTimerId = setInterval(() => {
+      if (!isPlaying) return;
+      try { worker.postMessage({ type: "stats" }); } catch {}
+    }, 5000);
+  }
+
+  function stopStatsTimer() {
+    if (statsTimerId) { clearInterval(statsTimerId); statsTimerId = null; }
+  }
+
+  window.__averaDebug = {
+    /** Relevé à la demande (résout au prochain statsReport). */
+    stats() {
+      return new Promise((resolve) => {
+        window.__statsResolve = resolve;
+        try { worker.postMessage({ type: "stats" }); } catch { resolve(null); }
+        setTimeout(() => {
+          if (window.__statsResolve === resolve) {
+            window.__statsResolve = null;
+            resolve(window.__avStats ?? null);
+          }
+        }, 2000);
+      });
+    },
+    render() {
+      renderWorker.postMessage({ type: "stats" });
+      return window.__renderStats ?? null;
+    },
+    enable() {
+      DEBUG_STATS = true;
+      startStatsTimer();
+      console.info("[debug] stats périodiques activées");
+    },
+    disable() {
+      DEBUG_STATS = false;
+      stopStatsTimer();
+      console.info("[debug] stats périodiques désactivées");
+    },
+    info() {
+      const sel = document.getElementById("video");
+      const src = sel?.value ?? null;
+      let abs = null;
+      try { abs = src ? new URL(src, location.href).href : null; } catch {}
+      return { src, url: abs };
+    },
+  };
+  console.info(
+    DEBUG_STATS
+      ? "[debug] stats périodiques (5 s) activées"
+      : "[debug] relevé : await __averaDebug.stats() · périodique : ?debug=1",
+  );
+
   let isPlaying = false;
   let mediaClockStartTime = performance.now() + performance.timeOrigin;
   let mediaClockStartSeconds = 0;
@@ -408,6 +501,8 @@ document.addEventListener("DOMContentLoaded", async function () {
   // Transfert : le canvas part au RENDER worker (pixels) ; le decode worker
   // reçoit le port vers lui (frames transférables + clear).
   const wantWasm = new URLSearchParams(location.search).get("nowasm") !== "1";
+  // Choix du moteur de rendu (diagnostic/contournement) : ?render=webgl|canvas2d|webgpu
+  const renderPref = new URLSearchParams(location.search).get("render") ?? "";
   // Contournement bug Firefox #2054811 (étirement VA-API sur H264 paddé,
   // fix branche 157) : forcer le décodage software. Priorité : ?sw=1/0, puis
   // choix utilisateur persisté, puis auto-détection (Firefox Linux <157).
@@ -446,9 +541,38 @@ document.addEventListener("DOMContentLoaded", async function () {
       type: "init",
       canvas: offscreenCanvas,
       port: avChannel.port2,
+      render: renderPref,
     },
     [offscreenCanvas, avChannel.port2],
   );
+  // Surface de rendu = taille affichée (CSS × DPR), pas la résolution source :
+  // une 4K dans une fenêtre 1080p ne doit pas peindre 9 Mpx par frame.
+  function sendDisplaySize() {
+    // Le conteneur est un flex-item en colonne (shrink-to-fit) : sa largeur
+    // suit le canvas, donc la borner par lui-même est circulaire. On borne
+    // par la largeur utile du viewport.
+    const cssW =
+      document.documentElement.clientWidth || window.innerWidth || 0;
+    const dpr = window.devicePixelRatio || 1;
+    if (cssW > 0) {
+      renderWorker.postMessage({
+        type: "displaySize",
+        width: Math.round(cssW * dpr),
+      });
+    }
+  }
+  sendDisplaySize();
+  let resizeTimer = null;
+  const onDisplayResize = () => {
+    clearTimeout(resizeTimer);
+    resizeTimer = setTimeout(sendDisplaySize, 150);
+  };
+  window.addEventListener("resize", onDisplayResize);
+  try {
+    new ResizeObserver(onDisplayResize).observe(
+      document.getElementById("videoCanvas"),
+    );
+  } catch {}
   worker.postMessage(
     {
       type: "init",
@@ -465,7 +589,13 @@ document.addEventListener("DOMContentLoaded", async function () {
   worker.onmessage = async function (e) {
     if (e.data.type === "statsReport") {
       window.__avStats = e.data;
-      console.log("[av-stats]", JSON.stringify(e.data));
+      if (window.__statsResolve) {
+        const resolve = window.__statsResolve;
+        window.__statsResolve = null;
+        resolve(e.data);
+      }
+      if (DEBUG_STATS) logStatsLine(e.data);
+      else console.debug("[av-stats]", JSON.stringify(e.data));
     } else if (e.data.type === "videoStatus") {
       // Update animation state
       isPlaying = e.data.isPlaying;
@@ -498,6 +628,7 @@ document.addEventListener("DOMContentLoaded", async function () {
     } else if (e.data.type === "initFinished") {
       document.getElementById("buffering").style.display = "none";
       document.getElementById("playStopButton").disabled = false;
+      startStatsTimer();
       totalTime = e.data.duration;
       mediaClockStartSeconds = 0;
       mediaClockStartTime = performance.now() + performance.timeOrigin;
@@ -574,7 +705,7 @@ document.addEventListener("DOMContentLoaded", async function () {
       }
     } else if (e.data.type == "offsetMediaTime") {
       // to offset the time from webaudio after a seek
-      if (audioContext) {
+        if (audioContext) {
         lastOffsetMediaTime = e.data.mediaTime - audioContext.currentTime;
       }
       mediaClockStartSeconds = e.data.mediaTime;
@@ -700,7 +831,9 @@ document.addEventListener("DOMContentLoaded", async function () {
         worker.postMessage({
           type: "updateMediaTime",
           pausedVideoTime: getMediaTime(),
-          videoTimeStart: performance.now() + performance.timeOrigin,
+          // Date.now() : même horloge epoch dans la page et le worker
+          // (performance.now() n'est PAS comparable entre les deux globales).
+          videoTimeStart: Date.now(),
         });
       }, UPDATE_INTERVAL);
 

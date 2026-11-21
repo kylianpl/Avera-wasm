@@ -1,8 +1,21 @@
 // From https://github.com/w3c/webcodecs/tree/724b7d620519450c0c9630ab4eb97fe555f9007b/samples/video-decode-display
 // in files render_2d, render_webgl, render_webgpu
 
+
+/** Taille de la surface de rendu : bornée à la largeur affichée (CSS × DPR).
+ * Une source 4000×2250 affichée dans 960 px n'a aucune raison de peindre 9 Mpx
+ * (fill-rate + mémoire) ; le canvas CSS remet à l'échelle. */
+function fitCanvasSize(frame, maxWidth) {
+  const sw = frame.displayWidth || 1;
+  const sh = frame.displayHeight || 1;
+  if (!(maxWidth > 0) || sw <= maxWidth) return [sw, sh];
+  const w = Math.round(maxWidth);
+  return [w, Math.max(1, Math.round(sh * (w / sw)))];
+}
+
 class WebGLRenderer {
   #canvas = null;
+  #maxWidth = 0;
   #ctx = null;
   #lastWidth = 0;
   #lastHeight = 0;
@@ -152,6 +165,11 @@ class WebGLRenderer {
     this.#peak = 203;
   }
 
+  /** Largeur d'affichage max (pixels physiques) ; 0 = pleine source. */
+  setMaxDisplayWidth(px) {
+    this.#maxWidth = Math.max(0, px | 0);
+  }
+
   /** État couleur : { mode:'sdr'|'pq'|'hlg', bt2020:bool, peak:nits }. */
   setColorState(state) {
     if (!state) return;
@@ -161,11 +179,12 @@ class WebGLRenderer {
   }
 
   draw(frame) {
-    if (frame.displayWidth !== this.#lastWidth || frame.displayHeight !== this.#lastHeight) {
-      this.#canvas.width = frame.displayWidth;
-      this.#canvas.height = frame.displayHeight;
-      this.#lastWidth = frame.displayWidth;
-      this.#lastHeight = frame.displayHeight;
+    const [w, h] = fitCanvasSize(frame, this.#maxWidth);
+    if (w !== this.#lastWidth || h !== this.#lastHeight) {
+      this.#canvas.width = w;
+      this.#canvas.height = h;
+      this.#lastWidth = w;
+      this.#lastHeight = h;
     }
 
     const gl = this.#ctx;
@@ -192,6 +211,7 @@ class WebGLRenderer {
 
 class WebGPURenderer {
   #canvas = null;
+  #maxWidth = 0;
   #ctx = null;
   #lastWidth = 0;
   #lastHeight = 0;
@@ -291,15 +311,20 @@ class WebGPURenderer {
     this.#sampler = this.#device.createSampler({});
   }
 
+  setMaxDisplayWidth(px) {
+    this.#maxWidth = Math.max(0, px | 0);
+  }
+
   async draw(frame) {
     // Don't try to draw any frames until the context is configured.
     await this.#started;
 
-    if (frame.displayWidth !== this.#lastWidth || frame.displayHeight !== this.#lastHeight) {
-      this.#canvas.width = frame.displayWidth;
-      this.#canvas.height = frame.displayHeight;
-      this.#lastWidth = frame.displayWidth;
-      this.#lastHeight = frame.displayHeight;
+    const [w, h] = fitCanvasSize(frame, this.#maxWidth);
+    if (w !== this.#lastWidth || h !== this.#lastHeight) {
+      this.#canvas.width = w;
+      this.#canvas.height = h;
+      this.#lastWidth = w;
+      this.#lastHeight = h;
     }
 
     const source = frame.source || frame.bitmap || frame;
@@ -357,6 +382,7 @@ class WebGPURenderer {
 
 class Canvas2DRenderer {
   #canvas = null;
+  #maxWidth = 0;
   #ctx = null;
   #lastWidth = 0;
   #lastHeight = 0;
@@ -366,14 +392,21 @@ class Canvas2DRenderer {
     this.#ctx = existingCtx ?? canvas.getContext("2d");
   }
 
+  setMaxDisplayWidth(px) {
+    this.#maxWidth = Math.max(0, px | 0);
+  }
+
   draw(frame) {
-    if (frame.displayWidth !== this.#lastWidth || frame.displayHeight !== this.#lastHeight) {
-      this.#canvas.width = frame.displayWidth;
-      this.#canvas.height = frame.displayHeight;
-      this.#lastWidth = frame.displayWidth;
-      this.#lastHeight = frame.displayHeight;
+    const [w, h] = fitCanvasSize(frame, this.#maxWidth);
+    if (w !== this.#lastWidth || h !== this.#lastHeight) {
+      this.#canvas.width = w;
+      this.#canvas.height = h;
+      this.#lastWidth = w;
+      this.#lastHeight = h;
     }
-    this.#ctx.drawImage(frame.source || frame.bitmap || frame, 0, 0, frame.displayWidth, frame.displayHeight);
+    // Destination = surface réelle du canvas (déjà bornée) : le navigateur
+    // redimensionne ensuite via CSS.
+    this.#ctx.drawImage(frame.source || frame.bitmap || frame, 0, 0, w, h);
   }
 
   clear() {

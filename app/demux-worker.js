@@ -21,6 +21,13 @@ let abort = null;
 let rangePromises = new Map();
 let port = null;
 
+// Compteurs I/O (diagnostic) : octets réellement reçus du réseau, requêtes,
+// temps passé en attente HTTP. Exposés par l'op RPC "stats".
+let ioBytes = 0;
+let ioRequests = 0;
+let ioMillis = 0;
+let ioStartedAt = 0;
+
 // Prélecture séquentielle (Streams API, opportuniste) : pendant la lecture
 // le démuxeur avance de façon monotone, donc un GET ouvert (Range `N-`)
 // débite les blocs suivants en un seul aller-retour au lieu d'un RTT par
@@ -67,6 +74,7 @@ async function seqPump(fromOff, gen, epoch) {
       if (fromOff !== 0n) return; // Range ignoré : le Range par bloc couvre
       base = 0n;
     }
+    ioRequests++;
     const reader = resp.body.getReader();
     seqReader = reader;
     seqNext = base;
@@ -93,6 +101,7 @@ async function seqPump(fromOff, gen, epoch) {
       if (gen !== generation || epoch !== seqEpoch) return;
       if (rd.done) return;
       if (!rd.value?.length) continue;
+      ioBytes += rd.value.length;
       carry = push(carry, rd.value);
       // Découpe les blocs alignés couverts par [seqNext, seqNext+carry).
       for (;;) {
@@ -182,6 +191,7 @@ async function fetchBlock(deviceName, blockStart, fetchLen, gen) {
   if (rangePromises.has(key)) return rangePromises.get(key);
   const promise = (async () => {
     const end = blockStart + fetchLen - 1;
+    const t0 = performance.now();
     const response = await fetch(url, {
       headers: { Range: `bytes=${blockStart}-${end}` },
       signal: abort?.signal,
@@ -191,7 +201,12 @@ async function fetchBlock(deviceName, blockStart, fetchLen, gen) {
       throw new Error(`HTTP ${response.status} for range ${blockStart}-${end}`);
     }
     let data = new Uint8Array(await response.arrayBuffer());
+    const wire = data.length; // octets réseau (200 = fichier entier, cf. dessous)
     if (response.status === 200) data = data.subarray(blockStart, blockStart + fetchLen);
+    ioRequests++;
+    ioBytes += wire;
+    ioMillis += performance.now() - t0;
+    if (!ioStartedAt) ioStartedAt = t0;
     await lib.ff_block_reader_dev_send(deviceName, blockStart, data);
   })().finally(() => {
     rangePromises.delete(key);
@@ -288,7 +303,14 @@ async function handleRpc(d) {
         const [sess, sts] = await ff_init_demuxer_file(lib, sourceName);
         session = sess;
         streams = sts;
-        reply(true, { streams, durationNs: String(sess.durationNs), chapters: sess.chapters ?? [] });
+        reply(true, {
+          streams,
+          durationNs: String(sess.durationNs),
+          chapters: sess.chapters ?? [],
+          sizeBytes: size,
+          kind: sess.kind ?? null,
+          url,
+        });
         break;
       }
       case "read": {
@@ -318,6 +340,26 @@ async function handleRpc(d) {
         if (!session) throw new Error("not open");
         const r = await av_seek_frame(session, d.streamIdx ?? -1, BigInt(Math.floor(Number(d.ns))), 0, 1);
         reply(true, { gen: d.gen, res: r });
+        break;
+      }
+      case "stats": {
+        reply(true, {
+          url,
+          kind: session?.kind ?? null,
+          sizeBytes: Number(lib?.vfs.get(sourceName)?.size ?? 0),
+          pos: Number(session?.readPos ?? 0),
+          eof: session?.eof ?? null,
+          ioBytes,
+          ioRequests,
+          ioMillis: Math.round(ioMillis),
+          ioStartedAt,
+          // Temps écoulé calculé ICI : performance.now() n'est pas comparable
+          // entre la page et ce worker (origines distinctes).
+          ioElapsedMs: ioStartedAt ? Math.round(performance.now() - ioStartedAt) : 0,
+          seqPumping,
+          seqFails,
+          seqNext: Number(seqNext),
+        });
         break;
       }
       case "close": {

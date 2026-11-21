@@ -387,3 +387,43 @@ propre avec le message FFmpeg, écart de version documenté).
   (GPU) ; headless rend en software, donc la validation porte sur le
   non-déclenchement du contournement et le rendu correct, pas sur la
   correction interne de Firefox.
+
+### Performances 4K60, synchro A-V et diagnostic console — FAIT
+- **Présentation à l'heure** : une frame décodée n'est plus envoyée au
+  renderer dès sa sortie (le décodeur peut sortir ~1 s d'avance → vidéo en
+  avance sur le son, flashs courts visibles trop tôt). Envoi seulement
+  quand `pts ≤ horloge + 2 ms` ; la tête est retirée du tampon après
+  transfert. Découverte au passage : `VSYNC_INTERVAL` valait 16,67 **µs**
+  (unité de `frame.timestamp`), donc quasiment toutes les frames étaient
+  « périmées » → ~50 % de drops. Corrigé à 50 ms.
+- **Mémoire / backpressure** : plafond de frames en vol vers le renderer
+  (≤2 ; sans lui le MessagePort accumulait ~750 Mio/s sur du 4K), tampon
+  de frames borné par octets (160 Mio), file décodeur adaptative
+  (4K → 4, 1080p → 12), et dépassement par la **fin** (frames futures) —
+  jeter la tête supprimait des frames non encore présentées.
+- **Audio robuste** : anneau 6 s / cible 4 s, refill de la seule file
+  demandée (`want`), timer de refill audio indépendant des frames vidéo,
+  pompage audio+vidéo concurrent (un RPC de read lent ne bloque plus la
+  vidéo). Plus de trous audibles même avec des refills de 1-2 s.
+- **Horloge** : âge des `updateMediaTime` calculé via `Date.now()` (les
+  origines `performance.now()` page/worker diffèrent), messages périmés
+  ignorés (>750 ms), ré-ancrage `offsetMediaTime` au démarrage. Le lecteur
+  cale la vidéo sur le son **entendu** (`outputLatency` soustraite).
+- **Rendu** : la surface du canvas est bornée à la largeur affichée
+  (CSS × DPR) au lieu de la résolution source — une 4000×2250 dans une
+  fenêtre 960 px ne peint plus 9 Mpx/frame. `?render=webgl|canvas2d|webgpu`
+  pour contourner un GPU récalcitrant.
+- **Diagnostic console** : `[media]` (URL, taille, conteneur, débit,
+  pistes), `[video]` (codec, résolution, WebCodecs/SW, profondeur),
+  `[audio] anneau bas …`, `[stats]` compact (I/O Mo et Mb/s, position
+  démux + prélecture, anneau, files, drops, horloge) via `?debug=1`
+  (5 s) ou `await __averaDebug.stats()`. Alerte unique si >40 % des frames
+  n'atteignent pas l'écran (source trop lourde pour le matériel).
+  Compteurs I/O exposés par la RPC démux `stats`.
+- **Validation** : suite unitaire 106/106, E2E 51/51 (+2 skip audio
+  headless). `av-sync-10s.mkv` : flashs 1/4/7 s, offsets A/V corrigés de
+  la latence de sortie ≈ 10-20 ms. BBB « native » 4000×2250 @ 60 fps
+  (832 Mio, 2 pistes audio) : lecture stable Chromium/Firefox headless,
+  anneau audio plein (min ≈ 2 s), pas de crash ; le décodage logiciel ne
+  tient pas 60 fps (frames sautées, avertissement explicite) — matériel
+  requis pour ce cas.

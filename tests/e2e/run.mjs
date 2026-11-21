@@ -302,14 +302,23 @@ async function scenarioSync(browser, name) {
     check("beeps détectés (espacement ≈ 3 s)", onsets.length >= 3 && og.every((g) => Math.abs(g - 3) < 0.2),
       `onsets=${onsets.map((t) => t.toFixed(2)).join(", ")}`);
     if (flashes.length && onsets.length) {
+      // Le tap audio (MediaStreamDestination) est pris à la sortie du graphe,
+      // SANS la latence de sortie ; le lecteur, lui, cale la vidéo sur le son
+      // ENTENDU (getMediaTime soustrait outputLatency). On compense donc la
+      // latence de sortie avant de juger la synchro.
+      const latMs = await page.evaluate(() => {
+        const a = window.__e2e?.audioState?.();
+        return a ? ((a.outputLatency ?? 0) + (a.baseLatency ?? 0)) * 1000 : 0;
+      });
       const offsets = [];
       for (const f of flashes) {
         const near = onsets.reduce((b, o) => (Math.abs(o - f) < Math.abs(b - f) ? o : b), onsets[0]);
-        offsets.push(near - f);
+        offsets.push(near - f + latMs / 1000);
       }
       const max = Math.max(...offsets.map(Math.abs));
       check("synchro A/V dans l'enregistrement (< 120 ms)", max < 0.12,
-        `décalages=${offsets.map((o) => (o * 1000).toFixed(0) + "ms").join(", ")}`);
+        `décalages=${offsets.map((o) => (o * 1000).toFixed(0) + "ms").join(", ")}` +
+        ` (latence sortie ${latMs.toFixed(0)} ms compensée)`);
     }
   }
   const st = await statsFrom(page);

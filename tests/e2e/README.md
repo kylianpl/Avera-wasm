@@ -24,7 +24,11 @@ et joué, puis on analyse l'enregistrement.
   mesure dans un seul fichier.
 - **Analyse** : `ffprobe` donne les timestamps réels (l'enregistrement est
   VFR), `ffmpeg` décode en gris (luminance) et en f32 (audio) ; on détecte
-  flashs et onsets puis on compare.
+  flashs et onsets puis on compare. Le tap audio étant pris à la sortie du
+  graphe (sans la latence du périphérique), la comparaison **ajoute
+  `outputLatency + baseLatency`** avant de juger : le lecteur, lui, cale la
+  vidéo sur le son réellement entendu. Avec cette compensation, les écarts
+  mesurés tombent à ~10-20 ms.
 - **Stats du player** : les messages des workers (`statsReport`,
   `renderStats`, `avDrift`, `workerLagReport`) sont collectés dans la page et
   lus par le harnais.

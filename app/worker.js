@@ -18,6 +18,16 @@ import {
 // une FAÇADE (mêmes noms/mêmes signatures) : I/O + lecture via RPC, pur en
 // direct. Les call sites ne changent pas.
 
+/** Durée lisible pour les logs ([media]). */
+function formatSec(seconds) {
+  if (!(seconds > 0)) return "?";
+  const t = Math.round(seconds);
+  const h = Math.floor(t / 3600);
+  const m = Math.floor((t % 3600) / 60);
+  const s = t % 60;
+  return (h ? `${h}:` : "") + `${String(m).padStart(2, "0")}:${String(s).padStart(2, "0")}`;
+}
+
 class MediaWorker {
   constructor() {
     this.canvas = null; // non utilisé (le canvas vit dans render-worker)
@@ -61,8 +71,10 @@ class MediaWorker {
     this.VideoDecoderPacket = null;
     this.VideoDecoderFrame = null;
 
-    this.DATA_BUFFER_DURATION = 4.0;
-    this.DATA_BUFFER_DECODE_TARGET_DURATION = 2.0;
+    // 6 s de capacité / cible 4 s : les frames 4K saturent le worker par
+    // rafales (GC, décodage) ; un creux de ~2 s ne doit pas trouer l'audio.
+    this.DATA_BUFFER_DURATION = 6.0;
+    this.DATA_BUFFER_DECODE_TARGET_DURATION = 4.0;
     this.DECODER_QUEUE_SIZE_MAX = 24; // file decodeur profonde (~1s) : les
     // décodeurs qui émettent par rafales se coincent nourris au compte-gouttes
     // (observé : 3/s plafonné à 5, 145/s en flood). La présentation (dû/périmé)
@@ -169,6 +181,8 @@ class MediaWorker {
         const r = await self.demuxCall("open", { url: self._openUrl, wasm: self._wantWasm ?? true });
         openCache.durationTicks = Number(r.durationNs) >= 0 ? Math.round(Number(r.durationNs) / 1000) : -1;
         openCache.chapters = r.chapters ?? [];
+        openCache.sizeBytes = r.sizeBytes ?? null;
+        openCache.kind = r.kind ?? null;
         self.formatContext = { url: self._openUrl };
         return [self.formatContext, r.streams];
       },
@@ -238,8 +252,10 @@ class MediaWorker {
       case "subtitle":
         await this.selectSubtitle(e.data.index);
         break;
-      case "stats":
+      case "stats": {
         // Debug beta : compteurs instantanés (inaudible en prod).
+        let demux = null;
+        try { demux = await this.demuxCall("stats"); } catch {}
         self.postMessage({          type: "statsReport",
           vFed: this._vFed ?? 0,
           vOut: this._vOut ?? 0,
@@ -257,13 +273,24 @@ class MediaWorker {
           playing: this.isPlaying,
           renderDrawn: this._renderDrawn ?? 0,
           posted: this._posted ?? 0,
+          inFlightFrames: this._framesInFlight ?? 0,
           staleDropped: this._staleDropped ?? 0,
           demuxPos: this._demuxPos ?? null,
+          lateDropped: this._lateDropped ?? 0,
+          frameMax: this.frameBufferMax(),
+          aRefillMs: Math.round(this._aRefillMs ?? 0),
+          readRpcMs: Math.round(this._readRpcMs ?? 0),
+          readRpcs: this._readRpcs ?? 0,
+          aFillAgo: this._aFillAt ? Math.round(performance.now() - this._aFillAt) : null,
+          ringMin: this._ringMin == null ? null : this._ringMin,
+          staleClock: this._staleClockUpdates ?? 0,
           ringSecs: (() => { try {
             return this.ringbuffer ? (this.ringbuffer.capacity() - this.ringbuffer.available_write()) / (this.channelCount * this.audioSampleRate) : null;
           } catch { return null; } })(),
+          demux,
         });
         break;
+      }
       default:
         console.warn("Unknown message type:", e.data.type);
     }
@@ -277,7 +304,10 @@ class MediaWorker {
     if (data && data.renderPort) {
       this.renderPort = data.renderPort;
       this.renderPort.onmessage = (e) => {
-        if (e.data && e.data.type === "drawn") this._renderDrawn++;
+        if (e.data && e.data.type === "drawn") {
+          this._renderDrawn = (this._renderDrawn ?? 0) + 1;
+          this._framesInFlight = Math.max(0, (this._framesInFlight ?? 0) - 1);
+        }
       };
     }
     // (canvas ignoré : appartient à render-worker ; les renderers
@@ -418,11 +448,36 @@ class MediaWorker {
       const chapters = await this.libav.ff_get_demuxer_chapters(
         this.formatContext,
       );
+      const mediaInfo = {
+        url: this._openUrl ?? null,
+        sizeBytes: this._openCache?.sizeBytes ?? null,
+        kind: this._openCache?.kind ?? null,
+        duration,
+      };
       self.postMessage({
         type: "initFinished",
         availableStreams: this.availableStreams,
         duration: duration,
+        mediaInfo,
       });
+      // Diagnostic : source + débit (lisible sans inspecter les workers).
+      try {
+        const sizeTxt = mediaInfo.sizeBytes
+          ? `${(mediaInfo.sizeBytes / 1048576).toFixed(1)} Mio`
+          : "taille ?";
+        const mbps = mediaInfo.sizeBytes && duration > 0
+          ? ` · ${((mediaInfo.sizeBytes * 8) / duration / 1e6).toFixed(1)} Mb/s`
+          : "";
+        console.info(`[media] ${mediaInfo.url}`);
+        console.info(`[media] ${sizeTxt} · ${mediaInfo.kind ?? "?"} · ${formatSec(duration)}${mbps}`);
+        for (const v of this.availableStreams.video) {
+          console.info(`[media] vidéo #${v.index} ${v.codec} ${v.width}x${v.height}${v.selected ? " (sélectionnée)" : ""}`);
+        }
+        for (const a of this.availableStreams.audio) {
+          console.info(`[media] audio #${a.index} ${a.codec} ${a.channelCount}ch ${a.sampleRate}Hz${a.selected ? " (sélectionnée)" : ""}`);
+        }
+        console.info("[debug] stats à la demande : __averaDebug.stats() · périodiques : ?debug=1");
+      } catch {}
       console.log(
         "%cFile information:",
         "font-weight: bold; font-size: x-large;",
@@ -948,6 +1003,7 @@ class MediaWorker {
   }
 
   async cleanupAudio() {
+    this.stopAudioRefillTimer();
     if (this.WCAudioDecoder) {
       if (this.WCAudioDecoder.state == "configured")
         this.WCAudioDecoder.close();
@@ -1111,6 +1167,9 @@ class MediaWorker {
     } catch (e) {
       console.warn("WebCodecs video config not supported, using LibAV.js fallback:", e);
     }
+    const vs = this.availableStreams.video.find(
+      (v) => v.index === this.videoStreamIndex,
+    );
     if (webCodecsSupported) {
       this.videoUseWebCodecs = true;
       this.WCVideoDecoder = new VideoDecoder({
@@ -1118,7 +1177,22 @@ class MediaWorker {
         error: (e) => console.error("VideoDecoder error:", e),
       });
       this.WCVideoDecoder.configure(videoConfig);
+      const px = Number(vs?.width ?? 0) * Number(vs?.height ?? 0);
+      console.info(
+        `[video] ${videoConfig.codec} ${vs?.width ?? "?"}x${vs?.height ?? "?"}` +
+          ` → WebCodecs (${this._forceSW ? "software forcé" : "HW préféré"}),` +
+          ` frame max ${this.frameBufferMax()}, decQ max ${this.decoderQueueMax()}`,
+      );
+      if (px >= 3840 * 2160 * 0.9 && !this._forceSW) {
+        console.warn(
+          `[video] source ${vs?.width}x${vs?.height} : décodage + upload lourds` +
+            " — les frames en retard seront jetées (pas de désynchro audio)",
+        );
+      }
     } else {
+      console.warn(
+        `[video] ${videoConfig.codec} non supporté par WebCodecs → décodeur logiciel WASM (lent)`,
+      );
       await this.setupFallbackVideoDecoder();
     }
   }
@@ -1435,6 +1509,11 @@ class MediaWorker {
     }
 
     this.isPlaying = true;
+    this._ringMin = null;
+    this._slowWarned = false;
+    this._slowCheckAt = performance.now();
+    this._playStartedAt = performance.now();
+    this.startAudioRefillTimer();
     // Use the first buffered frame's timestamp as the reference time,
     // so the stale check works even when frames start at non-zero pts.
     if (this.videoFrameBuffer.length > 0 && this.pausedVideoTime === 0) {
@@ -1442,6 +1521,16 @@ class MediaWorker {
     }
     this.videoTimeStart = performance.now();
     self.postMessage({ type: "videoStatus", isPlaying: this.isPlaying });
+    // Ré-ancre l'horloge audio sur le début réel (frames + anneau amorcé).
+    // Sans ça, si l'AudioContext a démarré au clic (geste utilisateur) pendant
+    // le prime (~0,5 s), son compteur avance sur du silence : la vidéo paraît
+    // 0,5 s en retard et toutes ses frames sont jetées comme « périmées ».
+    try {
+      self.postMessage({
+        type: "offsetMediaTime",
+        mediaTime: (this.pausedVideoTime ?? 0) / 1000,
+      });
+    } catch {}
     this.scheduleRenderLoop();
     this.schedulePipelinePump();
   }
@@ -1450,6 +1539,7 @@ class MediaWorker {
     if (!this.isPlaying) return;
 
     this.isPlaying = false;
+    this.stopAudioRefillTimer();
     this.pausedVideoTime =
       this.pausedVideoTime + (performance.now() - this.videoTimeStart);
     this.cancelRenderLoop();
@@ -1471,6 +1561,41 @@ class MediaWorker {
     }
   }
 
+  /** Refill audio indépendant du rythme des frames vidéo (4K60 : le pompage
+   * déclenché par chaque frame ne doit pas retarder l'anneau audio). */
+  startAudioRefillTimer() {
+    if (this._audioTimer || this.audioStreamIndex === -1) return;
+    this._audioTimer = setInterval(() => {
+      if (!this.isPlaying || this.isSeeking) return;
+      void this.feedAudioDecoder();
+      // Diagnostic : creux d'anneau = famine (audio décalé/perceptible).
+      try {
+        const ring = this.audioBufferSeconds();
+        if (ring < (this._ringMin ?? Infinity)) this._ringMin = ring;
+        if (ring < 0.3) {
+          const now = performance.now();
+          if (now - (this._lowRingWarnAt ?? 0) > 2000) {
+            this._lowRingWarnAt = now;
+            console.warn(
+              `[audio] anneau bas ${ring.toFixed(2)}s` +
+                ` (aQ=${this.audioPacketQueue.length},` +
+                ` fill=${this.audioFillInProgress ? "en cours" : "libre"},` +
+                ` refill=${Math.round(this._aRefillMs ?? 0)}ms,` +
+                ` decQ=${this.WCAudioDecoder?.decodeQueueSize ?? "-"})`,
+            );
+          }
+        }
+      } catch {}
+    }, 100);
+  }
+
+  stopAudioRefillTimer() {
+    if (this._audioTimer) {
+      clearInterval(this._audioTimer);
+      this._audioTimer = null;
+    }
+  }
+
   async pumpPipeline() {
     if (!this.formatContext || this.isSeeking) return;
     // Fencing d'époque : si un seek a eu lieu pendant les awaits ci-dessous,
@@ -1478,33 +1603,53 @@ class MediaWorker {
     // d'avant-seek nourris au décodeur reset → "needs a key chunk" + positions
     // atterrissant n'importe où — vu en beta surtout sans pause).
     const ep = this.seekSerial;
-    if (this.audioStreamIndex !== -1) await this.feedAudioDecoder();
+    // Audio et vidéo en parallèle : un refill audio lent (RPC démux) ne doit
+    // pas retarder le décodage vidéo → frames en retard → drops en rafale.
+    const jobs = [];
+    if (this.audioStreamIndex !== -1) jobs.push(this.feedAudioDecoder());
+    if (this.videoStreamIndex !== -1) jobs.push(this.feedVideoDecoder());
+    await Promise.allSettled(jobs);
     if (ep !== this.seekSerial) return;
-    if (this.videoStreamIndex !== -1) await this.feedVideoDecoder();
   }
 
   schedulePipelinePump() {
     if (this.pipelinePumpScheduled || this.isSeeking) return;
     this.pipelinePumpScheduled = true;
-    queueMicrotask(async () => {
+    // Macrotâche (pas microtâche) : une rafale de sorties décodeur ne doit
+    // pas affamer les timers (refill audio, RPC) — vu sur 4K60.
+    setTimeout(async () => {
       this.pipelinePumpScheduled = false;
       await this.pumpPipeline();
-    });
+    }, 0);
   }
 
   // Time management
 
   updateMediaTime(pausedVideoTime, videoTimeStart) {
+    // Message périmé : si le worker était saturé (grosse frame, GC), une
+    // rafale d'updates anciens ferait reculer l'horloge → frames jetées et
+    // dérive A/V transitoire. On garde le dernier état frais.
+    // Date.now() est partagé page/worker (contrairement à performance.now()).
+    const ageMs = Date.now() - videoTimeStart;
+    if (this.isPlaying && ageMs > 750) {
+      this._staleClockUpdates = (this._staleClockUpdates ?? 0) + 1;
+      return;
+    }
     const audioTimeMs = pausedVideoTime * 1000;
     this.lastAVDifference = audioTimeMs - this.currentVideoTime();
-    if (Math.abs(this.lastAVDifference) > 100) {
+    // Pas d'alerte pendant la première seconde (l'horloge n'est pas encore
+    // recalée sur le prime audio → faux positif à -0,5 s).
+    const warming = performance.now() - (this._playStartedAt ?? 0) < 1500;
+    if (!warming && Math.abs(this.lastAVDifference) > 100) {
       self.postMessage({
         type: "avDrift",
         driftMs: this.lastAVDifference,
       });
     }
     this.pausedVideoTime = audioTimeMs;
-    this.videoTimeStart = videoTimeStart - performance.timeOrigin;
+    // Ancre « maintenant » locale, recalée de l'âge du message : insensible
+    // aux origines performance.now() distinctes page/worker.
+    this.videoTimeStart = performance.now() - Math.max(0, ageMs);
   }
 
   currentVideoTime() {
@@ -1573,7 +1718,7 @@ class MediaWorker {
       this.PACKET_QUEUE_BYTES_AUDIO < this.PACKET_QUEUE_MAX_BYTES;
   }
 
-  async refillFrameQueues() {
+  async refillFrameQueues(want = null) {
     // Video step 1/4: fill videoPacketQueue with demuxed packets
     // Audio step 1/4: fill audioPacketQueue with demuxed packets
     if (this.isSeeking)
@@ -1586,16 +1731,21 @@ class MediaWorker {
 
     this.queueFillInProgress = true;
     try {
-      await this.refillFrameQueuesInternal();
+      await this.refillFrameQueuesInternal(want);
     } finally {
       this.queueFillInProgress = false;
     }
   }
-  async refillFrameQueuesInternal() {
+  async refillFrameQueuesInternal(want = null) {
     // Video step 1/4: fill videoPacketQueue with demuxed packets
     // Audio step 1/4: fill audioPacketQueue with demuxed packets
+    // `want` : ne remplir QUE la file demandée. Sans ça, l'audio attendait
+    // que la file vidéo atteigne 60 paquets (4K : plusieurs RPC lents) →
+    // refill de 1-2 s → anneau vidé. Le RPC read renvoie les deux files,
+    // donc rien n'est perdu.
     const ep = this.seekSerial; // fencing d'époque (cf. pumpPipeline)
-    if (!this.needsMorePackets("video") && !this.needsMorePackets("audio")) {
+    const need = (t) => (want == null || want === t) && this.needsMorePackets(t);
+    if (!need("video") && !need("audio")) {
       return;
     }
     if (!this.packet) {
@@ -1605,7 +1755,7 @@ class MediaWorker {
       console.warn("Format context not initialized");
       return;
     }
-    while (this.needsMorePackets("video") || this.needsMorePackets("audio")) {
+    while (need("video") || need("audio")) {
       const gotPackets = await this.readDemuxPackets(512 * 1024);
       if (ep !== this.seekSerial) return; // seek entre-temps : on abandonne
       if (this.fileEnded) return;
@@ -1624,12 +1774,15 @@ class MediaWorker {
     const gen = this.demuxGen ?? 0;
     const ep = this.seekSerial;
     let r;
+    const tRpc = performance.now();
     try {
       r = await this.demuxCall("read", {
         gen,
         videoIdx: this.videoStreamIndex,
         audioIdx: this.audioStreamIndex,
       });
+      this._readRpcMs = performance.now() - tRpc;
+      this._readRpcs = (this._readRpcs ?? 0) + 1;
     } catch (e) {
       console.error("Error reading frame:", e?.message ?? e);
       return false;
@@ -1687,7 +1840,7 @@ class MediaWorker {
         this.videoPacketQueue.length === 0 ||
         (this.audioStreamIndex !== -1 && this.audioPacketQueue.length === 0)
       ) {
-        await this.refillFrameQueues();
+        await this.refillFrameQueues("video");
         if (ep !== this.seekSerial) return; // seek entre-temps : paquets périmés
       }
       let packet = null;
@@ -1695,12 +1848,12 @@ class MediaWorker {
         if (
           this.videoUseWebCodecs &&
           this.WCVideoDecoder &&
-          this.WCVideoDecoder.decodeQueueSize >= this.DECODER_QUEUE_SIZE_MAX
+          this.WCVideoDecoder.decodeQueueSize >= this.decoderQueueMax()
         ) {
           break;
         }
         if (this.videoPacketQueue.length === 0) {
-          await this.refillFrameQueues();
+          await this.refillFrameQueues("video");
           if (ep !== this.seekSerial) return; // seek entre-temps : paquets périmés
           if (this.videoPacketQueue.length === 0) {
             break;
@@ -1708,6 +1861,7 @@ class MediaWorker {
         }
         packet = this.dequeuePacket("video");
         if (this.videoUseWebCodecs && this.WCVideoDecoder) {
+          if (this.WCVideoDecoder.state !== "configured") break;
           const chunk = LibAVJSWebCodecs.packetToEncodedVideoChunk(
             packet,
             this.streams[this.videoStreamIndex],
@@ -1733,6 +1887,35 @@ class MediaWorker {
     }
   }
 
+  /** Taille approximative d'une frame décodée (YUV420 8 bits). */
+  frameBytes() {
+    const st = this.streams?.[this.videoStreamIndex];
+    const w = Number(st?.codecpar?.width ?? 0);
+    const h = Number(st?.codecpar?.height ?? 0);
+    return w > 0 && h > 0 ? w * h * 1.5 : 0;
+  }
+
+  /** Plafond mémoire du tampon de frames (4K = 13,5 Mio → 11 frames). */
+  frameBufferMax() {
+    const b = this.frameBytes();
+    if (!b) return this.FRAME_BUFFER_TARGET_SIZE + 8;
+    return Math.max(
+      this.FRAME_BUFFER_TARGET_SIZE,
+      Math.min(24, Math.floor((160 * 1024 * 1024) / b)),
+    );
+  }
+
+  /** Profondeur du décodeur WebCodecs (4K → 4, 1080p → 12).
+   * Un décodeur profond laisse sortir ~1 s d'avance → tampon plein. */
+  decoderQueueMax() {
+    const b = this.frameBytes();
+    if (!b) return 12;
+    return Math.max(
+      4,
+      Math.min(12, Math.floor((64 * 1024 * 1024) / b)),
+    );
+  }
+
   bufferVideoFrame(frame) {
     // Video step 3/4: add decoded video frame to the frame buffer
     if (this.isSeeking && !this._priming)
@@ -1741,7 +1924,28 @@ class MediaWorker {
       );
     this._vOut = (this._vOut ?? 0) + 1;
     this._lastVOutT = performance.now();
+    // Frame déjà en retard sur l'horloge (= décodeur plus lent que le temps
+    // réel) : elle serait jetée à la présentation. On la ferme tout de suite
+    // pour ne pas gonfler la mémoire ni le GC (4K = 13,5 Mio/frame).
+    if (this.isPlaying && !this.isSeeking && !this._priming) {
+      let tsMs = null;
+      try { tsMs = frame.timestamp / 1000; } catch {}
+      if (tsMs != null && this.currentVideoTime() - tsMs > 250) {
+        try { frame.close(); } catch {}
+        this._lateDropped = (this._lateDropped ?? 0) + 1;
+        return;
+      }
+    }
     this.videoFrameBuffer.push(frame);
+    // Plafond mémoire dur. On jette par la FIN (frames futures) : jeter la
+    // tête supprimait des frames pas encore présentées (flashs courts perdus,
+    // vidéo en avance de ~1 s quand le décodeur sort par rafales).
+    const max = this.frameBufferMax();
+    while (this.videoFrameBuffer.length > max) {
+      const f = this.videoFrameBuffer.pop();
+      try { f.close(); } catch {}
+      this._lateDropped = (this._lateDropped ?? 0) + 1;
+    }
     this.schedulePipelinePump();
   }
 
@@ -1762,6 +1966,22 @@ class MediaWorker {
       }
     } catch {}
     const now = performance.now();
+    // Alerte unique : si une grande part des frames n'atteint jamais l'écran
+    // (source trop lourde pour ce navigateur/matériel), le dire clairement.
+    if (!this._slowWarned && this.isPlaying && (this._vOut ?? 0) > 120 &&
+        now - (this._slowCheckAt ?? 0) > 5000) {
+      const dropped = (this._lateDropped ?? 0) + (this._staleDropped ?? 0);
+      const ratio = dropped / Math.max(1, this._vOut);
+      if (ratio > 0.4) {
+        this._slowWarned = true;
+        console.warn(
+          `[video] ${Math.round(ratio * 100)} % des frames ne sont pas affichées` +
+            " (décodage/rendu trop lent pour cette source) — le son reste prioritaire ;" +
+            " si possible activez le décodage matériel ou une version plus légère",
+        );
+      }
+      this._slowCheckAt = now;
+    }
     const lm = this.lagMonitor;
 
     let frameTime = 0;
@@ -1798,7 +2018,11 @@ class MediaWorker {
   renderVideo() {
     if (this.videoFrameBuffer.length == 0) return;
     const currentTime = this.currentVideoTime() * 1000;
-    const VSYNC_INTERVAL = 16.67;
+    // Tolérance de péremption en MICROSECONDES (frame.timestamp est en µs,
+    // currentTime aussi : currentVideoTime() est en ms × 1000). L'ancienne
+    // valeur 16.67 valait 16,67 µs, pas 16,67 ms : quasi toutes les frames
+    // étaient « périmées » et jetées (flashs courts invisibles, ~50 % de drops).
+    const VSYNC_INTERVAL = 50 * 1000;
     while (
       this.videoFrameBuffer.length > 1 &&
       this.videoFrameBuffer[0].timestamp < currentTime - VSYNC_INTERVAL
@@ -1818,6 +2042,15 @@ class MediaWorker {
     let pts = null;
     try { pts = head.timestamp; } catch { return; }
     if (pts === this._lastSentPts) return;
+    // Présentation à l'heure : ne PAS envoyer une frame en avance. Le décodeur
+    // sort jusqu'à ~1 s d'avance (queue + burst) ; la poster tout de suite
+    // faisait jouer la vidéo en avance sur le son (flashs visibles ~1 s trop
+    // tôt, dérive A/V non détectée par l'horloge interne).
+    if (pts > currentTime + 2000) return; // µs (lead 2 ms)
+    // Backpressure : une frame 4K = 13,5 Mio. Sans plafond, si le renderer
+    // dessine moins vite qu'on ne poste, le MessagePort accumule tout
+    // (+750 Mio/s observés jusqu'au crash) : on garde ≤2 frames en vol.
+    if ((this._framesInFlight ?? 0) > 2) return;
     this._lastSentPts = pts;
     try {
       // Payload sans fonctions : les wrappers SW portent close() (non
@@ -1838,6 +2071,10 @@ class MediaWorker {
       else if (typeof ImageBitmap !== "undefined" && source instanceof ImageBitmap) xfer.push(source);
       this.renderPort.postMessage(payload, xfer);
       this._posted = (this._posted ?? 0) + 1;
+      this._framesInFlight = (this._framesInFlight ?? 0) + 1;
+      // La tête est partie (transférée) : on l'avance tout de suite pour que
+      // la suivante devienne tête et soit présentée à SON heure.
+      this.videoFrameBuffer.shift();
     } catch {
       this._lastSentPts = null;
     }
@@ -1846,6 +2083,8 @@ class MediaWorker {
   /** Signale au render worker d'oublier son image (seek/track-change). */
   postRenderClear() {
     this._lastSentPts = null; // la prochaine tête (même pts) doit repartir
+    this._framesInFlight = 0; // les acks en retard ne doivent pas bloquer
+    this._playStartedAt = performance.now(); // grâce après seek (drift)
     try { this.renderPort?.postMessage({ type: "clear" }); } catch {}
   }
 
@@ -1901,7 +2140,9 @@ class MediaWorker {
             this.WCAudioDecoder.decodeQueueSize < this.DECODER_QUEUE_SIZE_MAX))
       ) {
         if (this.audioPacketQueue.length === 0) {
-          await this.refillFrameQueues();
+          const tR = performance.now();
+          await this.refillFrameQueues("audio");
+          this._aRefillMs = performance.now() - tR;
           if (ep !== this.seekSerial) return; // seek entre-temps : paquets périmés
           if (this.audioPacketQueue.length === 0) {
             // Fin de piste ou famine : ne pas inonder la console (le pompage
@@ -1929,6 +2170,7 @@ class MediaWorker {
           );
           if (!this.WCAudioDecoder) return;
           this._aFed = (this._aFed ?? 0) + 1;
+          if (this.WCAudioDecoder.state !== "configured") break;
           this.WCAudioDecoder.decode(new EncodedAudioChunk(chunk));
         } else {
           if (!this.AudioDecoderCodecContext) return;
@@ -2105,6 +2347,8 @@ class MediaWorker {
     // Logging maxBufferHealth below shows we currently max around 73%, so we're
     // safe from the assert above *for now*. We should add an overflow buffer
     // just to be safe.
+    this._aFillAt = performance.now();
+    this._aFills = (this._aFills ?? 0) + 1;
     // let bufferHealth = this.bufferHealth();
     // if (!('maxBufferHealth' in this))
     //   this.maxBufferHealth = 0;
