@@ -290,13 +290,29 @@ export async function readMp4(session, lib, name, opts = {}) {
   const byIdx = {};
   const tracks = session.mp4.tracks;
   let spent = 0n;
+  // Priorité audio OPT-IN (changement de piste) : après un seek, le curseur
+  // vidéo est au keyframe (souvent loin avant la cible) et l'audio à la
+  // cible ; l'ordre par offset lisait tout le vidéo intermédiaire avant le
+  // premier paquet audio. La lecture normale n'active pas ce mode.
+  const audioFirstIdx = opts.audioFirstIdx == null ? -1 : Number(opts.audioFirstIdx);
+  const AUDIO_BURST = 64;
+  let audioBurst = 0;
   for (let guard = 0; guard < 400; guard++) {
     let bi = -1, boff = null;
-    for (let i = 0; i < tracks.length; i++) {
-      const t = tracks[i];
-      if (t.cursor >= t.samples.length) continue;
-      const s = t.samples[t.cursor];
-      if (bi < 0 || s.off < boff) { bi = i; boff = s.off; }
+    if (audioFirstIdx >= 0 && audioBurst < AUDIO_BURST) {
+      const ai = tracks.findIndex((t) => t.index === audioFirstIdx);
+      if (ai >= 0 && tracks[ai].cursor < tracks[ai].samples.length) {
+        bi = ai;
+        boff = tracks[ai].samples[tracks[ai].cursor].off;
+      }
+    }
+    if (bi < 0) {
+      for (let i = 0; i < tracks.length; i++) {
+        const t = tracks[i];
+        if (t.cursor >= t.samples.length) continue;
+        const s = t.samples[t.cursor];
+        if (bi < 0 || s.off < boff) { bi = i; boff = s.off; }
+      }
     }
     if (bi < 0) {
       session.readPos = session.size;
@@ -328,6 +344,7 @@ export async function readMp4(session, lib, name, opts = {}) {
       key: !!s.key,
     });
     t.cursor++;
+    if (t.index === audioFirstIdx) audioBurst++;
     spent += BigInt(data.length);
     session.readPos = s.off + BigInt(data.length);
     if (spent >= limit) return { res: 0, eof: false, byIdx };

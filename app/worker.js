@@ -627,10 +627,10 @@ class MediaWorker {
     this.fileEnded = false;
   }
 
-  async refillUntilPacketsAvailable(queue, serial, timeoutMs = 1500) {
+  async refillUntilPacketsAvailable(queue, serial, timeoutMs = 1500, opts = null) {
     const start = performance.now();
     while (queue.length === 0 && !this.fileEnded && serial === this.seekSerial) {
-      await this.readDemuxPackets(256 * 1024, serial);
+      await this.readDemuxPackets(256 * 1024, serial, opts);
       if (queue.length > 0 || this.fileEnded) break;
       if (performance.now() - start > timeoutMs) return false;
       await new Promise((r) => setTimeout(r, 5));
@@ -879,6 +879,7 @@ class MediaWorker {
       this.pausedVideoTime = currentTime * 1000;
       this.videoTimeStart = performance.now();
       this._playStartedAt = performance.now();
+      this._skipVideoBeforeUs = currentTime * 1e6 - 50000;
       self.postMessage({ type: "offsetMediaTime", mediaTime: currentTime });
       self.postMessage({ type: "buffering", buffering: false });
       if (this.isPlaying) {
@@ -965,7 +966,9 @@ class MediaWorker {
     // Une seule attente courte : si le RPC de lecture traîne (démux saturé par
     // le 4K), on ne bloque pas l'interface 5 s de plus — on reprend, et le
     // pompage remplira l'audio dès que les paquets arrivent.
-    const hasPackets = await this.refillUntilPacketsAvailable(queue, serial, 1500);
+    const hasPackets = await this.refillUntilPacketsAvailable(
+      queue, serial, 1500, streamType === "audio" ? { audioFirst: true } : null,
+    );
     if (serial !== this.seekSerial) return;
     if (!hasPackets || queue.length == 0) {
       // Ne JAMAIS laisser le render loop arrêté (sinon image figée jusqu'à
@@ -976,6 +979,7 @@ class MediaWorker {
       this.pausedVideoTime = currentTime * 1000;
       this.videoTimeStart = performance.now();
       this._playStartedAt = performance.now();
+      this._skipVideoBeforeUs = currentTime * 1e6 - 50000;
       self.postMessage({ type: "offsetMediaTime", mediaTime: currentTime });
       self.postMessage({ type: "buffering", buffering: false });
       if (this.isPlaying) {
@@ -1853,7 +1857,7 @@ class MediaWorker {
     }
   }
 
-  async readDemuxPackets(limit, serial = this.seekSerial) {
+  async readDemuxPackets(limit, serial = this.seekSerial, opts = null) {
     if (!this.packet) {
       this.packet = await this.libav.av_packet_alloc();
     }
@@ -1870,6 +1874,7 @@ class MediaWorker {
         gen,
         videoIdx: this.videoStreamIndex,
         audioIdx: this.audioStreamIndex,
+        audioFirst: !!(opts && opts.audioFirst),
       });
       this._readRpcMs = performance.now() - tRpc;
       this._readRpcs = (this._readRpcs ?? 0) + 1;

@@ -326,7 +326,11 @@ async function handleRpc(d) {
           for (const p of arr) { out.push(p); bytes += p.size ?? 0; }
         };
         while (guard++ < 12 && bytes < 2 * 1048576) {
-          const [res, dict] = await ff_read_frame_multi(session, {}, { limit: 524288 });
+          const [res, dict] = await ff_read_frame_multi(session, {}, {
+            limit: 524288,
+            // Priorité audio uniquement si demandée (changement de piste).
+            audioFirstIdx: d.audioFirst && aIdx != null && aIdx !== -1 ? aIdx : undefined,
+          });
           if (res === AVERROR_EOF) { eof = true; break; }
           if (res < 0) throw new Error(`demux read ${res}`);
           if (vIdx !== -1 && vIdx !== null) take(dict[vIdx] ?? [], video);
