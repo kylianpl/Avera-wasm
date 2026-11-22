@@ -200,18 +200,6 @@ class MediaWorker {
         const r = await self.demuxCall("seek", { streamIdx: stream, ns: String(ts), gen: self.demuxGen });
         return r.res ?? 0;
       },
-      /** Seek sans attendre la réponse (MP4 : synchrone côté démux ; l'ordre
-       * FIFO du port garantit que les read suivants voient le curseur). */
-      avformat_seek_file_nowait(fc, stream, ts) {
-        self.demuxGen = (self.demuxGen ?? 0) + 1;
-        try {
-          self.demuxPort?.postMessage({
-            id: -1, op: "seek", gen: self.demuxGen,
-            streamIdx: stream, ns: String(ts),
-          });
-        } catch {}
-        return 0;
-      },
       async ff_copyout_codecpar(t) { return ff_copyout_codecpar_raw(t); },
       avcodec_get_name(id) { return avcodec_get_name_raw(id); },
       async ff_error(r) { return ff_error_raw(r); },
@@ -644,10 +632,9 @@ class MediaWorker {
     const start = performance.now();
     let previousFrame = null;
     // Sans _priming, feedVideoDecoder jette tout pendant isSeeking : la boucle
-    // tournait 2 s à vide (freeze + spam) sans jamais choisir la frame.
+    // tournait 2 s à vide (freeze + spam) sans choisir la frame.
     const wasPriming = this._priming;
     this._priming = true;
-
     try {
     while (serial === this.seekSerial && performance.now() - start < 2000) {
       while (this.videoFrameBuffer.length > 0) {
@@ -831,9 +818,8 @@ class MediaWorker {
   }
 
   async changeStream(streamType, streamIndex) {
-    const tSwitch = performance.now();
-    const serial = ++this.seekSerial;
     console.log(`Changing ${streamType} stream to index ${streamIndex}`);
+    const serial = ++this.seekSerial;
     self.postMessage({ type: "buffering", buffering: true });
     this.isSeeking = true;
     this.cancelRenderLoop();
@@ -864,9 +850,8 @@ class MediaWorker {
     }
 
     const currentTime = this.currentVideoTime() / 1000;
-    // Fige l'horloge pendant l'opération : le décodeur logiciel (AC-3 WASM)
-    // peut mettre >1 s ; sans ça le temps mural avance et on revient en
-    // arrière à l'ancrage (saut/rejeu audible).
+    // Fige l'horloge pendant l'opération (décodeur SW AC-3 lent) : sinon le
+    // temps mural avance et l'ancrage fait un retour en arrière audible.
     this.pausedVideoTime = currentTime * 1000;
     this.videoTimeStart = performance.now();
 
@@ -906,21 +891,13 @@ class MediaWorker {
         this.streams[seekStream].time_base_den /
         this.streams[seekStream].time_base_num;
       let timestamp = currentTime * timebase;
-      if (this._openCache?.kind === "mp4" && streamType === "audio") {
-        // Pas d'attente du round-trip (le démux MP4 est synchrone ; un read
-        // envoyé après ce message verra déjà le curseur). Gain ~0,3-1 s.
-        seekRes = this.libav.avformat_seek_file_nowait(
-          this.formatContext, seekStream, timestamp,
-        );
-      } else {
-        seekRes = await this.libav.avformat_seek_file_max(
-          this.formatContext,
-          seekStream,
-          timestamp,
-          0,
-          0,
-        );
-      }
+      seekRes = await this.libav.avformat_seek_file_max(
+        this.formatContext,
+        seekStream,
+        timestamp,
+        0,
+        0,
+      );
       if (seekRes < 0) {
         console.error(
           "Error seeking during stream change:",
@@ -944,11 +921,12 @@ class MediaWorker {
         : this.videoPacketQueue;
     let hasPackets = await this.refillUntilPacketsAvailable(queue, serial, 1500);
     if (!hasPackets && serial === this.seekSerial) {
-      // 2e chance : le décodeur SW ou un read RPC ont pu saturer le worker.
       hasPackets = await this.refillUntilPacketsAvailable(queue, serial, 5000);
     }
     if (serial !== this.seekSerial) return;
     if (!hasPackets || queue.length == 0) {
+      // Ne JAMAIS laisser le render loop arrêté (sinon image figée jusqu'à
+      // une pause). On reprend, même sans amorçage audio.
       console.warn("No packets available after stream change — reprise sans amorçage");
       this.isSeeking = false;
       this.audioPrerollTargetSeconds = null;
@@ -957,28 +935,19 @@ class MediaWorker {
       self.postMessage({ type: "buffering", buffering: false });
       self.postMessage({ type: "offsetMediaTime", mediaTime: currentTime });
       if (this.isPlaying) {
-        this._ringMin = null;
-        this._playStartedAt = performance.now();
         this.startAudioRefillTimer();
         this.schedulePipelinePump();
       }
       this.scheduleRenderLoop();
-      console.info(`[stream] ${streamType} → ${streamIndex} échec d'amorçage (reprise)`);
       return;
     }
 
-    // Reprise : ancrage commun (horloge vidéo, preroll audio, offset main).
-    // Pour un changement AUDIO seul, on ne fait PAS de préroll vidéo : sur du
-    // 4K60 en décodage logiciel, décoder le GOP jusqu'à la position coûtait
-    // plusieurs secondes de freeze (le préroll tournait même 2 s à vide avant
-    // le correctif _priming). L'audio repart à currentTime ; la vidéo re-décode
-    // depuis le keyframe et rattrape via la présentation (frames périmées
-    // jetées, l'ancienne image reste affichée entre-temps).
-    let displayTime = currentTime;
-    if (streamType !== "audio") {
-      displayTime = await this.prerollVideoTo(currentTime, serial);
-      if (serial !== this.seekSerial) return;
-    }
+    // Même queue de reprise qu'un seek (cf. seek()) : preroll vidéo pour
+    // choisir displayTime, puis TOUT (horloge vidéo, preroll audio, offset
+    // main) ancré dessus. Avant : pas de preroll + offsetMediaTime sur le
+    // premier paquet (secondes d'écart) = désync permanente.
+    const displayTime = await this.prerollVideoTo(currentTime, serial);
+    if (serial !== this.seekSerial) return;
     this.pausedVideoTime = displayTime * 1000;
     if (this.isPlaying) {
       this.videoTimeStart = performance.now();
@@ -992,15 +961,10 @@ class MediaWorker {
 
     // Restart decoder feeds (cleanupAudio a arrêté le timer de refill)
     if (this.isPlaying) {
-      this._ringMin = null;
-      this._playStartedAt = performance.now();
       this.startAudioRefillTimer();
       this.schedulePipelinePump();
     }
     this.scheduleRenderLoop();
-    console.info(
-      `[stream] ${streamType} → ${streamIndex} prêt en ${Math.round(performance.now() - tSwitch)} ms`,
-    );
   }
 
   // Sélection sous-titres : scan complet sur session dédiée (curseurs A/V
@@ -1785,7 +1749,10 @@ class MediaWorker {
   async refillFrameQueues(want = null) {
     // Video step 1/4: fill videoPacketQueue with demuxed packets
     // Audio step 1/4: fill audioPacketQueue with demuxed packets
-    if (this.isSeeking) this._warnSeekFeed("refill");
+    if (this.isSeeking)
+      console.warn(
+        "refillFrameQueues called while seeking (from feedVideoDecoder or feedAudioDecoder)",
+      );
     if (this.queueFillInProgress || this.fileEnded) {
       return;
     }
@@ -1864,20 +1831,10 @@ class MediaWorker {
     return gotPackets;
   }
 
-  /** Un seul avertissement par seconde (évite des centaines de lignes). */
-  _warnSeekFeed(what) {
-    const now = performance.now();
-    this._seekFeedWarns = this._seekFeedWarns ?? {};
-    if (now - (this._seekFeedWarns[what] ?? 0) > 1000) {
-      this._seekFeedWarns[what] = now;
-      console.warn(`feed ${what} called while seeking (jeté)`);
-    }
-  }
-
   async feedVideoDecoder() {
     // Video step 2/4: send the demuxed video packets to the video decoder
     if (this.isSeeking && !this._priming) {
-      this._warnSeekFeed("video");
+      console.warn("feedVideoDecoder called while seeking (jeté)");
       return;
     }
     if (this.videoFillInProgress) return;
@@ -1976,16 +1933,14 @@ class MediaWorker {
     );
   }
 
-  /** Profondeur du décodeur WebCodecs. Un décodeur nourri au compte-gouttes
-   * se coince (observé : sortie 3/s puis plus rien à 4 de profondeur) ; il
-   * lui faut une file d'environ 1 s. Budget ~192 Mio (4K = 13,5 Mio/frame
-   * → 14 ; 1080p → 24). */
+  /** Profondeur du décodeur WebCodecs (4K → 4, 1080p → 12).
+   * Un décodeur profond laisse sortir ~1 s d'avance → tampon plein. */
   decoderQueueMax() {
     const b = this.frameBytes();
-    if (!b) return this.DECODER_QUEUE_SIZE_MAX;
+    if (!b) return 12;
     return Math.max(
-      8,
-      Math.min(12, Math.floor((192 * 1024 * 1024) / b)),
+      4,
+      Math.min(12, Math.floor((64 * 1024 * 1024) / b)),
     );
   }
 
@@ -1997,39 +1952,21 @@ class MediaWorker {
       );
     this._vOut = (this._vOut ?? 0) + 1;
     this._lastVOutT = performance.now();
+    // Pas de drop sec à l'entrée : quand le décodeur 4K logiciel est plus
+    // lent que le temps réel, TOUTES les frames sont en retard et les jeter
+    // ici gelait l'image pour de bon. La présentation trie (périmées) et le
+    // plafond mémoire borne la consommation.
     this.videoFrameBuffer.push(frame);
-    // Plafond mémoire. Ne JAMAIS jeter une frame en retard à l'entrée : quand
-    // le décodeur 4K logiciel tourne à ~17 fps, toutes les frames sont en
-    // retard et le drop sec gelait la vidéo pour de bon. Ici : si la tête est
-    // en retard on l'écarte (on se rapproche du direct), sinon on jette la fin
-    // (frames futures) pour préserver la tête due.
+    // Plafond mémoire dur. On jette par la FIN (frames futures) : jeter la
+    // tête supprimait des frames pas encore présentées (flashs courts perdus,
+    // vidéo en avance de ~1 s quand le décodeur sort par rafales).
     const max = this.frameBufferMax();
     while (this.videoFrameBuffer.length > max) {
-      let late = false;
-      try {
-        // Ne jeter la tête que si elle est très en retard (décodeur lent) :
-        // à 50 ms, on supprimait des frames utiles sur les fichiers légers.
-        late = this.videoFrameBuffer[0].timestamp < (this.currentVideoTime() * 1000) - 500000;
-      } catch {}
-      const f = late ? this.videoFrameBuffer.shift() : this.videoFrameBuffer.pop();
+      const f = this.videoFrameBuffer.pop();
       try { f.close(); } catch {}
       this._lateDropped = (this._lateDropped ?? 0) + 1;
     }
     this.schedulePipelinePump();
-    this.schedulePresent();
-  }
-
-  /** Présente sans dépendre uniquement de la rAF du worker (throttlée en
-   * arrière-plan / parfois arrêtée) : une macrotâche coalescée, jamais dans le
-   * callback du décodeur (Firefox n'aime pas y transférer les frames). */
-  schedulePresent() {
-    if (this._presentScheduled || !this.isPlaying || this.isSeeking) return;
-    this._presentScheduled = true;
-    setTimeout(() => {
-      this._presentScheduled = false;
-      if (!this.isPlaying || this.isSeeking) return;
-      try { this.renderVideo(); } catch {}
-    }, 0);
   }
 
   renderVideoLoop() {
@@ -2174,7 +2111,7 @@ class MediaWorker {
   async feedAudioDecoder() {
     // Audio step 2/3: send the demuxed audio packets to the audio decoder
     if (this.isSeeking && !this._priming) {
-      this._warnSeekFeed("audio");
+      console.warn("feedAudioDecoder called while seeking (jeté)");
       return;
     }
     if (this.audioFillInProgress) return;

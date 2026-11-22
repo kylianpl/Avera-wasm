@@ -450,14 +450,17 @@ propre avec le message FFmpeg, écart de version documenté).
   froid, fiable et ancré, est conservé.
 - **Gel de la vidéo après ~8 s (4K60 logiciel)** : le garde « frame > 250 ms
   de retard → jetée » supprimait *toutes* les frames quand le décodeur
-  tournait à ~30 fps (tardives en hausse, `vBuf` à 0, image figée). Supprimé.
-  Le plafond mémoire jette la tête seulement si elle est **très** en retard
-  (> 500 ms), sinon la fin. Tolérance de présentation 50 ms ; une minuterie
-  coalescée présente les frames hors callback décodeur (la rAF du worker
-  peut être throttlée/arrêtée et Firefox n'aime pas transférer une frame
-  depuis le callback). Limite assumée : un 4K60 H.264 **décodé en
-  logiciel** (~30 fps) ne peut pas rester en temps réel ; le son reste
-  maître et la vidéo est best-effort (avertissement explicite). Pour une
-  fluidité parfaite, il faut le décodage matériel ou une source plus
-  légère (le pipeline n'effectue pas de saut de GOP : cela affamait
-  l'audio et n'était pas fiable).
+  tournait à ~30 fps (tardives en hausse, `vBuf` à 0, image figée). Seul ce
+  drop a été retiré (la présentation trie et le plafond mémoire borne) :
+  l'image avance à nouveau, même lentement.
+- **Retour à l'état de lecture connu-bon** : les essais suivants (lecture
+  audio d'abord dans le MP4, seek MP4 sans attente, jet de la tête du
+  tampon, présentation depuis le callback décodeur puis par minuterie,
+  file décodeur élargie) ont régressé la lecture normale (gel ~8 s, image
+  noire sous Firefox, dérive A/V ~150 ms). Ils ont été **annulés** ; seuls
+  sont conservés, côté changement de piste : armement `_priming`, reprise
+  garantie si `No packets`, horloge figée pendant l'opération et timer de
+  refill réarmé. Limite assumée : un 4K60 H.264 **décodé en logiciel**
+  (~30 fps) ne peut pas rester en temps réel ; le son reste maître et la
+  vidéo est best-effort (avertissement explicite). Pour une fluidité
+  parfaite, décodage matériel ou source plus légère.
