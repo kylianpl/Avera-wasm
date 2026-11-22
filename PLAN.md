@@ -460,7 +460,13 @@ propre avec le message FFmpeg, écart de version documenté).
   noire sous Firefox, dérive A/V ~150 ms). Ils ont été **annulés** ; seuls
   sont conservés, côté changement de piste : armement `_priming`, reprise
   garantie si `No packets`, horloge figée pendant l'opération et timer de
-  refill réarmé. Limite assumée : un 4K60 H.264 **décodé en logiciel**
+  refill réarmé. Côté switch uniquement aussi : pas de préroll vidéo (audio
+  seul), seek MP4 envoyé sans attendre, timeout audio annulé, avertissements
+  limités, chien de garde à 4 s (jamais de buffering infini) et surtout
+  `offsetMediaTime` envoyé **avant** `buffering:false` — l'ancien ordre
+  appliquait l'offset après la reprise de l'AudioContext (course → dérive
+  ~1,6 s). Mesuré : 0,1-0,3 s typique, 4 s max (watchdog), plus d'alerte de
+  dérive. Limite assumée : un 4K60 H.264 **décodé en logiciel**
   (~30 fps) ne peut pas rester en temps réel ; le son reste maître et la
   vidéo est best-effort (avertissement explicite). Pour une fluidité
   parfaite, décodage matériel ou source plus légère.

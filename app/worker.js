@@ -200,6 +200,18 @@ class MediaWorker {
         const r = await self.demuxCall("seek", { streamIdx: stream, ns: String(ts), gen: self.demuxGen });
         return r.res ?? 0;
       },
+      /** Seek MP4 sans attendre la réponse (le démux est synchrone ; l'ordre
+       * FIFO du port garantit que les read suivants voient le curseur). */
+      avformat_seek_file_nowait(fc, stream, ts) {
+        self.demuxGen = (self.demuxGen ?? 0) + 1;
+        try {
+          self.demuxPort?.postMessage({
+            id: -1, op: "seek", gen: self.demuxGen,
+            streamIdx: stream, ns: String(ts),
+          });
+        } catch {}
+        return 0;
+      },
       async ff_copyout_codecpar(t) { return ff_copyout_codecpar_raw(t); },
       avcodec_get_name(id) { return avcodec_get_name_raw(id); },
       async ff_error(r) { return ff_error_raw(r); },
@@ -811,13 +823,14 @@ class MediaWorker {
     if (serial !== this.seekSerial) return;
     this.pausedVideoTime = displayTime * 1000;
     this.videoTimeStart = performance.now();
-    this.schedulePipelinePump();
-    self.postMessage({ type: "buffering", buffering: false });
     self.postMessage({ type: "offsetMediaTime", mediaTime: displayTime });
+    self.postMessage({ type: "buffering", buffering: false });
+    this.schedulePipelinePump();
     this.scheduleRenderLoop();
   }
 
   async changeStream(streamType, streamIndex) {
+    const tSwitch = performance.now();
     console.log(`Changing ${streamType} stream to index ${streamIndex}`);
     const serial = ++this.seekSerial;
     self.postMessage({ type: "buffering", buffering: true });
@@ -854,6 +867,30 @@ class MediaWorker {
     // temps mural avance et l'ancrage fait un retour en arrière audible.
     this.pausedVideoTime = currentTime * 1000;
     this.videoTimeStart = performance.now();
+    this._playStartedAt = performance.now(); // pas d'alerte drift pendant le switch
+    // Chien de garde : un RPC de lecture bloqué ne doit pas laisser le
+    // lecteur en buffering plus de 4 s.
+    this._switchWatchdog = setTimeout(() => {
+      if (!this.isSeeking || serial !== this.seekSerial) return;
+      console.warn("[stream] changement de piste bloqué > 4 s — reprise");
+      this.seekSerial++; // invalide l'opération en cours
+      this.isSeeking = false;
+      this.audioPrerollTargetSeconds = null;
+      this.pausedVideoTime = currentTime * 1000;
+      this.videoTimeStart = performance.now();
+      this._playStartedAt = performance.now();
+      self.postMessage({ type: "offsetMediaTime", mediaTime: currentTime });
+      self.postMessage({ type: "buffering", buffering: false });
+      if (this.isPlaying) {
+        this.startAudioRefillTimer();
+        this.schedulePipelinePump();
+      }
+      this.scheduleRenderLoop();
+    }, 4000);
+    if (this.feedAudioDecoderTimeout) {
+      clearTimeout(this.feedAudioDecoderTimeout);
+      this.feedAudioDecoderTimeout = null;
+    }
 
     if (streamType === "audio") {
       this.audioStreamIndex = streamIndex;
@@ -891,13 +928,19 @@ class MediaWorker {
         this.streams[seekStream].time_base_den /
         this.streams[seekStream].time_base_num;
       let timestamp = currentTime * timebase;
-      seekRes = await this.libav.avformat_seek_file_max(
-        this.formatContext,
-        seekStream,
-        timestamp,
-        0,
-        0,
-      );
+      if (this._openCache?.kind === "mp4" && streamType === "audio") {
+        seekRes = this.libav.avformat_seek_file_nowait(
+          this.formatContext, seekStream, timestamp,
+        );
+      } else {
+        seekRes = await this.libav.avformat_seek_file_max(
+          this.formatContext,
+          seekStream,
+          timestamp,
+          0,
+          0,
+        );
+      }
       if (seekRes < 0) {
         console.error(
           "Error seeking during stream change:",
@@ -919,10 +962,10 @@ class MediaWorker {
       this.audioStreamIndex != -1
         ? this.audioPacketQueue
         : this.videoPacketQueue;
-    let hasPackets = await this.refillUntilPacketsAvailable(queue, serial, 1500);
-    if (!hasPackets && serial === this.seekSerial) {
-      hasPackets = await this.refillUntilPacketsAvailable(queue, serial, 5000);
-    }
+    // Une seule attente courte : si le RPC de lecture traîne (démux saturé par
+    // le 4K), on ne bloque pas l'interface 5 s de plus — on reprend, et le
+    // pompage remplira l'audio dès que les paquets arrivent.
+    const hasPackets = await this.refillUntilPacketsAvailable(queue, serial, 1500);
     if (serial !== this.seekSerial) return;
     if (!hasPackets || queue.length == 0) {
       // Ne JAMAIS laisser le render loop arrêté (sinon image figée jusqu'à
@@ -932,23 +975,32 @@ class MediaWorker {
       this.audioPrerollTargetSeconds = null;
       this.pausedVideoTime = currentTime * 1000;
       this.videoTimeStart = performance.now();
-      self.postMessage({ type: "buffering", buffering: false });
+      this._playStartedAt = performance.now();
       self.postMessage({ type: "offsetMediaTime", mediaTime: currentTime });
+      self.postMessage({ type: "buffering", buffering: false });
       if (this.isPlaying) {
         this.startAudioRefillTimer();
         this.schedulePipelinePump();
       }
       this.scheduleRenderLoop();
+      if (this._switchWatchdog) {
+        clearTimeout(this._switchWatchdog);
+        this._switchWatchdog = null;
+      }
       return;
     }
 
-    // Même queue de reprise qu'un seek (cf. seek()) : preroll vidéo pour
-    // choisir displayTime, puis TOUT (horloge vidéo, preroll audio, offset
-    // main) ancré dessus. Avant : pas de preroll + offsetMediaTime sur le
-    // premier paquet (secondes d'écart) = désync permanente.
-    const displayTime = await this.prerollVideoTo(currentTime, serial);
-    if (serial !== this.seekSerial) return;
+    // Reprise : pour un changement AUDIO seul, PAS de préroll vidéo (décoder
+    // le GOP 4K jusqu'à la position prenait des secondes). On ancre sur
+    // currentTime ; la vidéo se recale via la présentation. Pour un changement
+    // vidéo, préroll comme un seek (choisit displayTime).
+    let displayTime = currentTime;
+    if (streamType !== "audio") {
+      displayTime = await this.prerollVideoTo(currentTime, serial);
+      if (serial !== this.seekSerial) return;
+    }
     this.pausedVideoTime = displayTime * 1000;
+    this._playStartedAt = performance.now(); // grâce drift après switch
     if (this.isPlaying) {
       this.videoTimeStart = performance.now();
     }
@@ -956,8 +1008,10 @@ class MediaWorker {
     await this.primeAudioBuffer(serial);
     if (serial !== this.seekSerial) return;
     this.isSeeking = false;
-    self.postMessage({ type: "buffering", buffering: false });
+    // Offset AVANT la reprise : l'AudioContext est encore suspendu, l'offset
+    // est donc calculé sur son currentTime figé (sinon course → dérive).
     self.postMessage({ type: "offsetMediaTime", mediaTime: displayTime });
+    self.postMessage({ type: "buffering", buffering: false });
 
     // Restart decoder feeds (cleanupAudio a arrêté le timer de refill)
     if (this.isPlaying) {
@@ -965,6 +1019,13 @@ class MediaWorker {
       this.schedulePipelinePump();
     }
     this.scheduleRenderLoop();
+    if (this._switchWatchdog) {
+      clearTimeout(this._switchWatchdog);
+      this._switchWatchdog = null;
+    }
+    console.info(
+      `[stream] ${streamType} → ${streamIndex} prêt en ${Math.round(performance.now() - tSwitch)} ms`,
+    );
   }
 
   // Sélection sous-titres : scan complet sur session dédiée (curseurs A/V
@@ -1749,10 +1810,7 @@ class MediaWorker {
   async refillFrameQueues(want = null) {
     // Video step 1/4: fill videoPacketQueue with demuxed packets
     // Audio step 1/4: fill audioPacketQueue with demuxed packets
-    if (this.isSeeking)
-      console.warn(
-        "refillFrameQueues called while seeking (from feedVideoDecoder or feedAudioDecoder)",
-      );
+    if (this.isSeeking) this._warnSeekFeed("refill");
     if (this.queueFillInProgress || this.fileEnded) {
       return;
     }
@@ -1831,10 +1889,19 @@ class MediaWorker {
     return gotPackets;
   }
 
+  _warnSeekFeed(what) {
+    const now = performance.now();
+    this._seekFeedWarns = this._seekFeedWarns ?? {};
+    if (now - (this._seekFeedWarns[what] ?? 0) > 1000) {
+      this._seekFeedWarns[what] = now;
+      console.warn(`feed ${what} called while seeking (jeté)`);
+    }
+  }
+
   async feedVideoDecoder() {
     // Video step 2/4: send the demuxed video packets to the video decoder
     if (this.isSeeking && !this._priming) {
-      console.warn("feedVideoDecoder called while seeking (jeté)");
+      this._warnSeekFeed("video");
       return;
     }
     if (this.videoFillInProgress) return;
@@ -2111,7 +2178,7 @@ class MediaWorker {
   async feedAudioDecoder() {
     // Audio step 2/3: send the demuxed audio packets to the audio decoder
     if (this.isSeeking && !this._priming) {
-      console.warn("feedAudioDecoder called while seeking (jeté)");
+      this._warnSeekFeed("audio");
       return;
     }
     if (this.audioFillInProgress) return;
