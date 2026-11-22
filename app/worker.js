@@ -999,6 +999,35 @@ class MediaWorker {
     this.audioPrerollTargetSeconds = this.audioStreamIndex !== -1 ? displayTime : null;
     await this.primeAudioBuffer(serial);
     if (serial !== this.seekSerial) return;
+
+    // Ne pas démarrer le son avant que la vidéo ait une frame à l'heure :
+    // sinon on entend l'audio seul puis la vidéo rattrape en accéléré.
+    if (this.videoStreamIndex !== -1 && this._skipVideoBeforeUs != null) {
+      const skip = this._skipVideoBeforeUs;
+      const deadline = performance.now() + 800;
+      const hasDue = () => this.videoFrameBuffer.some((f) => {
+        try { return f.timestamp >= skip; } catch { return false; }
+      });
+      const wasPriming = this._priming;
+      this._priming = true;
+      try {
+        while (serial === this.seekSerial && performance.now() < deadline && !hasDue()) {
+          // Écarte le backlog d'avant-switch pour laisser entrer la suite.
+          while (this.videoFrameBuffer.length > 0) {
+            let old = false;
+            try { old = this.videoFrameBuffer[0].timestamp < skip; } catch {}
+            if (!old || this.videoFrameBuffer.length === 1) break;
+            const f = this.videoFrameBuffer.shift();
+            try { f.close(); } catch {}
+          }
+          await this.feedVideoDecoder();
+          await new Promise((r) => setTimeout(r, 5));
+        }
+      } finally {
+        this._priming = wasPriming;
+      }
+    }
+    if (serial !== this.seekSerial) return;
     this.isSeeking = false;
     // Offset AVANT la reprise : l'AudioContext est encore suspendu, l'offset
     // est donc calculé sur son currentTime figé (sinon course → dérive).
