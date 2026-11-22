@@ -1001,6 +1001,10 @@ class MediaWorker {
     }
     this.pausedVideoTime = displayTime * 1000;
     this._playStartedAt = performance.now(); // grâce drift après switch
+    // Après un switch, la vidéo re-décode depuis le keyframe (frames en
+    // retard). Les afficher « au plus vite » produisait un fast-forward ;
+    // on les saute sans les présenter jusqu'à la première frame à l'heure.
+    this._skipVideoBeforeUs = displayTime * 1e6 - 50000;
     if (this.isPlaying) {
       this.videoTimeStart = performance.now();
     }
@@ -2105,6 +2109,24 @@ class MediaWorker {
   renderVideo() {
     if (this.videoFrameBuffer.length == 0) return;
     const currentTime = this.currentVideoTime() * 1000;
+    // Rattrapage post-switch : jeter les frames antérieures à l'instant de
+    // reprise SANS les afficher (évite le fast-forward), puis reprendre.
+    if (this._skipVideoBeforeUs != null) {
+      while (
+        this.videoFrameBuffer.length > 0 &&
+        this.videoFrameBuffer[0].timestamp < this._skipVideoBeforeUs
+      ) {
+        const f = this.videoFrameBuffer.shift();
+        try { f.close(); } catch {}
+      }
+      if (
+        this.videoFrameBuffer.length > 0 &&
+        this.videoFrameBuffer[0].timestamp >= this._skipVideoBeforeUs
+      ) {
+        this._skipVideoBeforeUs = null;
+      }
+      if (this.videoFrameBuffer.length === 0) return;
+    }
     // Tolérance de péremption en MICROSECONDES (frame.timestamp est en µs,
     // currentTime aussi : currentVideoTime() est en ms × 1000). L'ancienne
     // valeur 16.67 valait 16,67 µs, pas 16,67 ms : quasi toutes les frames
@@ -2170,6 +2192,7 @@ class MediaWorker {
   /** Signale au render worker d'oublier son image (seek/track-change). */
   postRenderClear() {
     this._lastSentPts = null; // la prochaine tête (même pts) doit repartir
+    this._skipVideoBeforeUs = null;
     this._framesInFlight = 0; // les acks en retard ne doivent pas bloquer
     this._playStartedAt = performance.now(); // grâce après seek (drift)
     try { this.renderPort?.postMessage({ type: "clear" }); } catch {}
