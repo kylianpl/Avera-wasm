@@ -741,6 +741,7 @@ class MediaWorker {
     }
 
     this.isSeeking = true;
+    this._clockFrozen = false;
     await this.resetPipelineForSeek();
     var seekStream =
       this.videoStreamIndex != -1
@@ -825,6 +826,7 @@ class MediaWorker {
     this.videoTimeStart = performance.now();
     self.postMessage({ type: "offsetMediaTime", mediaTime: displayTime });
     self.postMessage({ type: "buffering", buffering: false });
+    this._clockFrozen = false;
     this.schedulePipelinePump();
     this.scheduleRenderLoop();
   }
@@ -868,26 +870,9 @@ class MediaWorker {
     this.pausedVideoTime = currentTime * 1000;
     this.videoTimeStart = performance.now();
     this._playStartedAt = performance.now(); // pas d'alerte drift pendant le switch
-    // Chien de garde : un RPC de lecture bloqué ne doit pas laisser le
-    // lecteur en buffering plus de 4 s.
-    this._switchWatchdog = setTimeout(() => {
-      if (!this.isSeeking || serial !== this.seekSerial) return;
-      console.warn("[stream] changement de piste bloqué > 4 s — reprise");
-      this.seekSerial++; // invalide l'opération en cours
-      this.isSeeking = false;
-      this.audioPrerollTargetSeconds = null;
-      this.pausedVideoTime = currentTime * 1000;
-      this.videoTimeStart = performance.now();
-      this._playStartedAt = performance.now();
-      this._skipVideoBeforeUs = currentTime * 1e6 - 50000;
-      self.postMessage({ type: "offsetMediaTime", mediaTime: currentTime });
-      self.postMessage({ type: "buffering", buffering: false });
-      if (this.isPlaying) {
-        this.startAudioRefillTimer();
-        this.schedulePipelinePump();
-      }
-      this.scheduleRenderLoop();
-    }, 4000);
+    // Gèle l'horloge : sans ça, le temps mural continue pendant le buffering
+    // et la vidéo se retrouve des secondes en avance sur le son.
+    this._clockFrozen = true;
     if (this.feedAudioDecoderTimeout) {
       clearTimeout(this.feedAudioDecoderTimeout);
       this.feedAudioDecoderTimeout = null;
@@ -976,6 +961,7 @@ class MediaWorker {
       console.warn("No packets available after stream change — reprise sans amorçage");
       this.isSeeking = false;
       this.audioPrerollTargetSeconds = null;
+      this._clockFrozen = false;
       this.pausedVideoTime = currentTime * 1000;
       this.videoTimeStart = performance.now();
       this._playStartedAt = performance.now();
@@ -987,10 +973,6 @@ class MediaWorker {
         this.schedulePipelinePump();
       }
       this.scheduleRenderLoop();
-      if (this._switchWatchdog) {
-        clearTimeout(this._switchWatchdog);
-        this._switchWatchdog = null;
-      }
       return;
     }
 
@@ -1003,7 +985,9 @@ class MediaWorker {
       displayTime = await this.prerollVideoTo(currentTime, serial);
       if (serial !== this.seekSerial) return;
     }
+    this._clockFrozen = false;
     this.pausedVideoTime = displayTime * 1000;
+    this.videoTimeStart = performance.now();
     this._playStartedAt = performance.now(); // grâce drift après switch
     // Après un switch, la vidéo re-décode depuis le keyframe (frames en
     // retard). Les afficher « au plus vite » produisait un fast-forward ;
@@ -1027,10 +1011,6 @@ class MediaWorker {
       this.schedulePipelinePump();
     }
     this.scheduleRenderLoop();
-    if (this._switchWatchdog) {
-      clearTimeout(this._switchWatchdog);
-      this._switchWatchdog = null;
-    }
     console.info(
       `[stream] ${streamType} → ${streamIndex} prêt en ${Math.round(performance.now() - tSwitch)} ms`,
     );
@@ -1606,6 +1586,7 @@ class MediaWorker {
     }
 
     this.isPlaying = true;
+    this._clockFrozen = false;
     this._ringMin = null;
     this._slowWarned = false;
     this._slowCheckAt = performance.now();
@@ -1636,6 +1617,7 @@ class MediaWorker {
     if (!this.isPlaying) return;
 
     this.isPlaying = false;
+    this._clockFrozen = false;
     this.stopAudioRefillTimer();
     this.pausedVideoTime =
       this.pausedVideoTime + (performance.now() - this.videoTimeStart);
@@ -1723,6 +1705,7 @@ class MediaWorker {
   // Time management
 
   updateMediaTime(pausedVideoTime, videoTimeStart) {
+    if (this._clockFrozen) return;
     // Message périmé : si le worker était saturé (grosse frame, GC), une
     // rafale d'updates anciens ferait reculer l'horloge → frames jetées et
     // dérive A/V transitoire. On garde le dernier état frais.
@@ -1750,6 +1733,7 @@ class MediaWorker {
   }
 
   currentVideoTime() {
+    if (this._clockFrozen) return this.pausedVideoTime ?? 0;
     if (this.isPlaying) {
       return this.pausedVideoTime + (performance.now() - this.videoTimeStart);
     } else if (this.pausedVideoTime !== null) {
