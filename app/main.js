@@ -58,7 +58,7 @@ async function initializeAudio(channelCount, sampleRate, sharedArrayBuffer) {
     console.warn(
       `initializeAudio: rate mismatch (ctx=${audioContext.sampleRate} vs stream=${sampleRate}), recreating`,
     );
-    console.log(`[audio] close ${audioContext.sampleRate}Hz (→ ${sampleRate}Hz)`);
+    console.log(`[audio] closing ${audioContext.sampleRate}Hz (→ ${sampleRate}Hz)`);
     await audioContext.close();
     audioContext = null;
     audioStreamActivated = false;
@@ -189,7 +189,7 @@ document.addEventListener("DOMContentLoaded", async function () {
       window.__renderStats = e.data;
       if (DEBUG_STATS) {
         console.info(
-          `[render] drawn ${e.data.drawn} · remplacées ${e.data.replaced} · image ${e.data.hasFrame ? "oui" : "non"}`,
+          `[render] drawn ${e.data.drawn} · replaced ${e.data.replaced} · frame ${e.data.hasFrame ? "yes" : "no"}`,
         );
       }
     } else if (e.data && e.data.type === "captureFrame") {
@@ -251,7 +251,7 @@ document.addEventListener("DOMContentLoaded", async function () {
         return m;
       },
     };
-    console.log("[capture] mode E2E activé");
+    console.log("[capture] E2E mode enabled");
   }
   // --- Diagnostic console (toujours disponible) ---------------------------
   // `?debug=1` : un relevé [stats] toutes les 5 s pendant la lecture.
@@ -312,12 +312,12 @@ document.addEventListener("DOMContentLoaded", async function () {
     enable() {
       DEBUG_STATS = true;
       startStatsTimer();
-      console.info("[debug] stats périodiques activées");
+      console.info("[debug] periodic stats enabled");
     },
     disable() {
       DEBUG_STATS = false;
       stopStatsTimer();
-      console.info("[debug] stats périodiques désactivées");
+      console.info("[debug] periodic stats disabled");
     },
     info() {
       const sel = document.getElementById("video");
@@ -329,8 +329,8 @@ document.addEventListener("DOMContentLoaded", async function () {
   };
   console.info(
     DEBUG_STATS
-      ? "[debug] stats périodiques (5 s) activées"
-      : "[debug] relevé : await __averaDebug.stats() · périodique : ?debug=1",
+      ? "[debug] periodic stats (5 s) enabled"
+      : "[debug] on-demand stats: await __averaDebug.stats() · periodic: ?debug=1",
   );
 
   let isPlaying = false;
@@ -534,7 +534,7 @@ document.addEventListener("DOMContentLoaded", async function () {
     });
   }
   if (forceSW) {
-    console.log("[decode] décodage software forcé (?sw=1 / toggle / auto Firefox<157) — contournement https://bugzilla.mozilla.org/show_bug.cgi?id=2054811");
+    console.log("[decode] software decoding forced (?sw=1 / toggle / auto Firefox<157) — workaround https://bugzilla.mozilla.org/show_bug.cgi?id=2054811");
   }
   renderWorker.postMessage(
     {
@@ -716,7 +716,7 @@ document.addEventListener("DOMContentLoaded", async function () {
       // "+" embalait le temps : retard vidéo → saut avant → plus de retard).
       // Le retard se purge par drops (présentation), jamais par saut d'horloge.
       if (Math.abs(e.data.driftMs) > 500) {
-        console.warn(`[av] drift soutenu ${Math.round(e.data.driftMs)}ms (purge par drops)`);
+        console.warn(`[av] sustained drift ${Math.round(e.data.driftMs)}ms (recovered by dropping frames)`);
       }
     } else if (e.data.type === "workerLagReport") {
       const fpsCounter = document.getElementById("fpsCounter");
@@ -747,7 +747,7 @@ document.addEventListener("DOMContentLoaded", async function () {
       const targetStream = availableStreams?.audio?.find(s => s.index === idx);
       if (targetStream) {
         if (audioContext && audioContext.sampleRate !== targetStream.sampleRate) {
-          console.log(`[audio] close ${audioContext.sampleRate}Hz → pre-create ${targetStream.sampleRate}Hz`);
+          console.log(`[audio] closing ${audioContext.sampleRate}Hz → pre-create ${targetStream.sampleRate}Hz`);
           audioContext.close();
           audioContext = tryCreateAudioContext(targetStream.sampleRate);
         } else if (!audioContext) {

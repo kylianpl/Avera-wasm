@@ -180,7 +180,7 @@ export class HEVCSession {
     this._paramNals = [...ps.vps, ...ps.sps, ...ps.pps];
     for (const nal of this._paramNals) this.dec.pushNal(nal, 0n);
     if (this._paramNals.length) {
-      console.log(`[sw-dec] paramètres hvcC fournis : VPS=${ps.vps.length} SPS=${ps.sps.length} PPS=${ps.pps.length}`);
+      console.log(`[sw-dec] hvcC parameters provided: VPS=${ps.vps.length} SPS=${ps.sps.length} PPS=${ps.pps.length}`);
     }
   }
 

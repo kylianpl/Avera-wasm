@@ -483,12 +483,12 @@ class MediaWorker {
         console.info(`[media] ${mediaInfo.url}`);
         console.info(`[media] ${sizeTxt} · ${mediaInfo.kind ?? "?"} · ${formatSec(duration)}${mbps}`);
         for (const v of this.availableStreams.video) {
-          console.info(`[media] vidéo #${v.index} ${v.codec} ${v.width}x${v.height}${v.selected ? " (sélectionnée)" : ""}`);
+          console.info(`[media] video #${v.index} ${v.codec} ${v.width}x${v.height}${v.selected ? " (selected)" : ""}`);
         }
         for (const a of this.availableStreams.audio) {
-          console.info(`[media] audio #${a.index} ${a.codec} ${a.channelCount}ch ${a.sampleRate}Hz${a.selected ? " (sélectionnée)" : ""}`);
+          console.info(`[media] audio #${a.index} ${a.codec} ${a.channelCount}ch ${a.sampleRate}Hz${a.selected ? " (selected)" : ""}`);
         }
-        console.info("[debug] stats à la demande : __averaDebug.stats() · périodiques : ?debug=1");
+        console.info("[debug] on-demand stats: __averaDebug.stats() · periodic: ?debug=1");
       } catch {}
       console.log(
         "%cFile information:",
@@ -958,7 +958,7 @@ class MediaWorker {
     if (!hasPackets || queue.length == 0) {
       // Ne JAMAIS laisser le render loop arrêté (sinon image figée jusqu'à
       // une pause). On reprend, même sans amorçage audio.
-      console.warn("No packets available after stream change — reprise sans amorçage");
+      console.warn("No packets available after stream change — resuming without priming");
       this.isSeeking = false;
       this.audioPrerollTargetSeconds = null;
       this._clockFrozen = false;
@@ -1041,7 +1041,7 @@ class MediaWorker {
     }
     this.scheduleRenderLoop();
     console.info(
-      `[stream] ${streamType} → ${streamIndex} prêt en ${Math.round(performance.now() - tSwitch)} ms`,
+      `[stream] ${streamType} → ${streamIndex} ready in ${Math.round(performance.now() - tSwitch)} ms`,
     );
   }
 
@@ -1064,7 +1064,7 @@ class MediaWorker {
       : family === "ass" ? parseAssPacket
       : family === "tx3g" ? parseTx3gSample : null;
     if (!parse) {
-      console.warn(`[sub] famille non supportée : ${family || "?"} (texte seul v1)`);
+      console.warn(`[sub] unsupported family: ${family || "?"} (text only v1)`);
       self.postMessage({ type: "subtitleCues", cues: [] });
       return;
     }
@@ -1086,10 +1086,10 @@ class MediaWorker {
           }
           cues.sort((a, b) => a.startNs - b.startNs);
           this.subtitleCues = cues;
-          console.log(`[sub] piste ${streamIndex} (${family}) : ${cues.length} cues en ${d.ms} ms`);
+          console.log(`[sub] track ${streamIndex} (${family}): ${cues.length} cues in ${d.ms} ms`);
           self.postMessage({ type: "subtitleCues", cues });
         } else if (d?.type === "error") {
-          console.warn("[sub] scan impossible:", d.error);
+          console.warn("[sub] scan failed:", d.error);
           self.postMessage({ type: "subtitleCues", cues: [] });
         }
         try { worker.terminate(); } catch {}
@@ -1103,7 +1103,7 @@ class MediaWorker {
       };
       worker.postMessage({ type: "start", url: this._openUrl, trackIdx: streamIndex });
     } catch (e) {
-      console.warn("[sub] scan impossible:", e?.message ?? e);
+      console.warn("[sub] scan failed:", e?.message ?? e);
       self.postMessage({ type: "subtitleCues", cues: [] });
     }
   }
@@ -1249,7 +1249,7 @@ class MediaWorker {
     };
     try { this.renderPort?.postMessage({ type: "color", state }); } catch {}
     if (state.mode !== "sdr") {
-      console.log(`[hdr] flux ${state.mode}${state.bt2020 ? " BT.2020" : ""} → tone mapping SDR (${state.peak} nits)`);
+      console.log(`[hdr] stream ${state.mode}${state.bt2020 ? " BT.2020" : ""} → SDR tone mapping (${state.peak} nits)`);
     }
   }
 
@@ -1263,7 +1263,7 @@ class MediaWorker {
     // https://bugzilla.mozilla.org/show_bug.cgi?id=2054811
     if (this._forceSW) {
       videoConfig = { ...videoConfig, hardwareAcceleration: "prefer-software" };
-      console.log("[decode] software forcé (contournement Firefox #2054811)");
+      console.log("[decode] software forced (Firefox #2054811 workaround)");
     }
     this.videoConfig = videoConfig;
     this.sendColorState();
@@ -1286,18 +1286,18 @@ class MediaWorker {
       const px = Number(vs?.width ?? 0) * Number(vs?.height ?? 0);
       console.info(
         `[video] ${videoConfig.codec} ${vs?.width ?? "?"}x${vs?.height ?? "?"}` +
-          ` → WebCodecs (${this._forceSW ? "software forcé" : "HW préféré"}),` +
+          ` → WebCodecs (${this._forceSW ? "software forced" : "HW preferred"}),` +
           ` frame max ${this.frameBufferMax()}, decQ max ${this.decoderQueueMax()}`,
       );
       if (px >= 3840 * 2160 * 0.9 && !this._forceSW) {
         console.warn(
-          `[video] source ${vs?.width}x${vs?.height} : décodage + upload lourds` +
-            " — les frames en retard seront jetées (pas de désynchro audio)",
+          `[video] source ${vs?.width}x${vs?.height}: heavy decode + upload` +
+            " — late frames will be dropped (audio stays in sync)",
         );
       }
     } else {
       console.warn(
-        `[video] ${videoConfig.codec} non supporté par WebCodecs → décodeur logiciel WASM (lent)`,
+        `[video] ${videoConfig.codec} not supported by WebCodecs → WASM software decoder (slow)`,
       );
       await this.setupFallbackVideoDecoder();
     }
@@ -1685,9 +1685,9 @@ class MediaWorker {
           if (now - (this._lowRingWarnAt ?? 0) > 2000) {
             this._lowRingWarnAt = now;
             console.warn(
-              `[audio] anneau bas ${ring.toFixed(2)}s` +
+              `[audio] low ring ${ring.toFixed(2)}s` +
                 ` (aQ=${this.audioPacketQueue.length},` +
-                ` fill=${this.audioFillInProgress ? "en cours" : "libre"},` +
+                ` fill=${this.audioFillInProgress ? "busy" : "idle"},` +
                 ` refill=${Math.round(this._aRefillMs ?? 0)}ms,` +
                 ` decQ=${this.WCAudioDecoder?.decodeQueueSize ?? "-"})`,
             );
@@ -1916,7 +1916,7 @@ class MediaWorker {
     this._seekFeedWarns = this._seekFeedWarns ?? {};
     if (now - (this._seekFeedWarns[what] ?? 0) > 1000) {
       this._seekFeedWarns[what] = now;
-      console.warn(`feed ${what} called while seeking (jeté)`);
+      console.warn(`feed ${what} called while seeking (dropped)`);
     }
   }
 
@@ -2069,7 +2069,7 @@ class MediaWorker {
         performance.now() - (this._lastVOutT ?? 0) > 10000 &&
         (this.videoPacketQueue.length > 0 || (this.videoFrameBuffer?.length ?? 0) > 0);
       if (stalled) {
-        console.warn("[decode] stall vidéo 10s DÉTECTÉ (reset désactivé en diagnostic)");
+        console.warn("[decode] video stall 10s DETECTED (reset disabled in diagnostic mode)");
         this._lastVOutT = performance.now(); // répit 10s avant prochain signalement
         this.schedulePipelinePump();
       }
@@ -2084,9 +2084,9 @@ class MediaWorker {
       if (ratio > 0.4) {
         this._slowWarned = true;
         console.warn(
-          `[video] ${Math.round(ratio * 100)} % des frames ne sont pas affichées` +
-            " (décodage/rendu trop lent pour cette source) — le son reste prioritaire ;" +
-            " si possible activez le décodage matériel ou une version plus légère",
+          `[video] ${Math.round(ratio * 100)}% of frames are not displayed` +
+            " (decode/render too slow for this source) — audio stays master;" +
+            " enable hardware decoding or use a lighter source if possible",
         );
       }
       this._slowCheckAt = now;
@@ -2279,7 +2279,7 @@ class MediaWorker {
             this._audioEmptyCount = (this._audioEmptyCount ?? 0) + 1;
             if (now - (this._audioEmptyWarnAt ?? 0) > 2000) {
               console.warn(
-                `No more audio packets available (${this._audioEmptyCount} fois)`,
+                `No more audio packets available (${this._audioEmptyCount} times)`,
               );
               this._audioEmptyWarnAt = now;
               this._audioEmptyCount = 0;

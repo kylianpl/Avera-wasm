@@ -151,6 +151,6 @@ export async function createMP4VSession(codecpar, codecName) {
   const api = await loadModule();
   const slot = api.create(codecName, width, height);
   if (slot < 0) throw new Error(`[sw-dec] mp4v_create(${codecName}) a échoué (${slot})`);
-  console.log(`[sw-dec] décodeur logiciel ${codecName} activé (WASM FFmpeg) : ${width}x${height}`);
+  console.log(`[sw-dec] software decoder ${codecName} enabled (WASM FFmpeg): ${width}x${height}`);
   return new MP4VSession(api, slot, { codec: codecName, width, height });
 }

@@ -95,7 +95,7 @@ export class EAC3Session {
       data = new Float32Array(api.mod.HEAPF32.buffer, this._outPtr, n * ch).slice();
     } else {
       if (!this._warnedLayout) {
-        console.warn(`[sw-dec] ${this.codec}: ${ch} voies décodées ≠ ${this.channels} déclarées (remappage)`);
+        console.warn(`[sw-dec] ${this.codec}: ${ch} decoded channels ≠ ${this.channels} declared (remapping)`);
         this._warnedLayout = true;
       }
       const src = new Float32Array(api.mod.HEAPF32.buffer, this._outPtr, n * ch);
@@ -155,6 +155,6 @@ export async function createEAC3Session(codecpar) {
   const api = await loadModule();
   const slot = api.create(codecId);
   if (slot < 0) throw new Error(`[sw-dec] eac3_create a échoué (${slot})`);
-  console.log(`[sw-dec] décodeur logiciel ${family} activé (WASM FFmpeg) : ${channels}ch ${sampleRate}Hz`);
+  console.log(`[sw-dec] software decoder ${family} enabled (WASM FFmpeg): ${channels}ch ${sampleRate}Hz`);
   return new EAC3Session(api, slot, { codec: family, channels, sampleRate });
 }

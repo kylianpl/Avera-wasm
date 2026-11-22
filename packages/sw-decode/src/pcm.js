@@ -22,7 +22,7 @@ export function createPCMSession({ channels, sampleRate, bits, isFloat, isBigEnd
   }
   const bps = bits / 8;
   const le = !be; // DataView : littleEndian flag
-  console.log(`[sw-dec] pont PCM logiciel : ${channels}ch ${sampleRate}Hz ${isFloat ? "f" : "s"}${bits}${be ? "be" : "le"}`);
+  console.log(`[sw-dec] software PCM bridge: ${channels}ch ${sampleRate}Hz ${isFloat ? "f" : "s"}${bits}${be ? "be" : "le"}`);
   return {
     decode(packetBytes, ptsUs) {
       if (!packetBytes?.length) return [];

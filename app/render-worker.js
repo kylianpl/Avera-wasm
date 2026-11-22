@@ -147,7 +147,7 @@ async function onPortMessage(d) {
       next.setColorState?.(colorState);
       renderer = next;
       applyMaxWidth();
-      console.log(`[render] HDR (${colorState.mode}) : rendu WebGL + tone mapping`);
+      console.log(`[render] HDR (${colorState.mode}): WebGL render + tone mapping`);
     }
     if (inflight) {
       try { renderer.draw(inflight); } catch {}
@@ -166,7 +166,7 @@ async function pickRenderer(c, { preferWebGL = false } = {}) {
   // Même ordre et mêmes sondes qu'AVERA d'origine (worker.js createRenderer).
   // ?render=webgl|canvas2d : diagnostic/contournement GPU (HDR = WebGL).
   if (!preferWebGL && renderPref === "canvas2d") {
-    console.log("Canvas2D forcé (?render=canvas2d)");
+    console.log("Canvas2D forced (?render=canvas2d)");
     const r = new Canvas2DRenderer(c, c.getContext("2d"));
     r.kind = "2d";
     return r;
@@ -174,19 +174,19 @@ async function pickRenderer(c, { preferWebGL = false } = {}) {
   if (!preferWebGL && renderPref === "webgl") {
     const g2 = c.getContext("webgl2");
     if (g2) {
-      console.log("WebGL2 forcé (?render=webgl)");
+      console.log("WebGL2 forced (?render=webgl)");
       const r = new WebGLRenderer(c, "webgl2", g2);
       r.kind = "webgl2";
       return r;
     }
     const g1 = c.getContext("webgl");
     if (g1) {
-      console.log("WebGL1 forcé (?render=webgl)");
+      console.log("WebGL1 forced (?render=webgl)");
       const r = new WebGLRenderer(c, "webgl", g1);
       r.kind = "webgl";
       return r;
     }
-    console.warn("WebGL indisponible, repli automatique");
+    console.warn("WebGL unavailable, falling back automatically");
   }
   if (!preferWebGL && renderPref !== "canvas2d" && typeof WebGPURenderer !== "undefined" && navigator.gpu) {
     try {

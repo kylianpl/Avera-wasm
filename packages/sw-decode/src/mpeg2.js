@@ -150,6 +150,6 @@ export async function createMPEG2Session(codecpar, codecName) {
   const api = await loadModule();
   const slot = api.create(codecName, width, height);
   if (slot < 0) throw new Error(`[sw-dec] mpeg2_create(${codecName}) a échoué (${slot})`);
-  console.log(`[sw-dec] décodeur logiciel ${codecName} activé (WASM FFmpeg) : ${width}x${height}`);
+  console.log(`[sw-dec] software decoder ${codecName} enabled (WASM FFmpeg): ${width}x${height}`);
   return new MPEG2Session(api, slot, { codec: codecName, width, height });
 }

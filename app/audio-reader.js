@@ -46,7 +46,7 @@ class AudioReaderProcessor extends AudioWorkletProcessor {
       this.underruns++;
       if (currentTime - this.lastWarnTime >= 2) {
         console.warn(
-          `[audio-worklet] sous-alimentation : ${this.underruns} quantum(s) partiel(s) (dernier ${read}/${this.deinterleaveBuffer.length})`,
+          `[audio-worklet] underrun: ${this.underruns} partial quantum(s) (last ${read}/${this.deinterleaveBuffer.length})`,
         );
         this.underruns = 0;
         this.lastWarnTime = currentTime;

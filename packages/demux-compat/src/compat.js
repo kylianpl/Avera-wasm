@@ -997,17 +997,17 @@ export async function ff_init_decoder(codec_id, codecpar) {
   if (name !== "hevc") {
     if (name === "ac3" || name === "eac3") {
       const ctx = await SW.createEAC3Session(codecpar?.family ? codecpar : { ...codecpar, family: name });
-      console.log("[sw-dec] décodeur logiciel audio activé (WASM FFmpeg)");
+      console.log("[sw-dec] software audio decoder enabled (WASM FFmpeg)");
       return [null, ctx, {}, {}];
     }
     if (name === "dts") {
       const ctx = await SW.createDCASession(codecpar?.family ? codecpar : { ...codecpar, family: name });
-      console.log("[sw-dec] décodeur logiciel audio activé (WASM FFmpeg)");
+      console.log("[sw-dec] software audio decoder enabled (WASM FFmpeg)");
       return [null, ctx, {}, {}];
     }
     if (name === "truehd") {
       const ctx = await SW.createTRUEHDSession(codecpar?.family ? codecpar : { ...codecpar, family: name });
-      console.log("[sw-dec] décodeur logiciel audio activé (WASM FFmpeg)");
+      console.log("[sw-dec] software audio decoder enabled (WASM FFmpeg)");
       return [null, ctx, {}, {}];
     }
     if (name === "pcm") {
@@ -1019,7 +1019,7 @@ export async function ff_init_decoder(codec_id, codecpar) {
         isFloat: !!cp.isFloat,
         isBigEndian: !!cp.isBigEndian,
       });
-      console.log("[sw-dec] pont PCM logiciel activé");
+      console.log("[sw-dec] software PCM bridge enabled");
       return [null, ctx, {}, {}];
     }
     if (name === "mp4v" || name === "h263" || name === "msmpeg4v1" ||
@@ -1039,20 +1039,20 @@ export async function ff_init_decoder(codec_id, codecpar) {
         }
       } catch {}
       const ctx = await SW.createMP4VSession(codecpar, decoder);
-      console.log(`[sw-dec] décodeur logiciel ${decoder} activé (WASM FFmpeg)`);
+      console.log(`[sw-dec] software decoder ${decoder} enabled (WASM FFmpeg)`);
       return [null, ctx, {}, {}];
     }
     if (name === "mpeg2video") {
       // MPEG-1/2 (DVD, TV, TS) : jamais supporté WebCodecs.
       const decoder = "mpeg2video";
       const ctx = await SW.createMPEG2Session(codecpar, decoder);
-      console.log(`[sw-dec] décodeur logiciel ${decoder} activé (WASM FFmpeg)`);
+      console.log(`[sw-dec] software decoder ${decoder} enabled (WASM FFmpeg)`);
       return [null, ctx, {}, {}];
     }
     throw new Error(`SW fallback non migré pour ${name} (Phase 4 : HEVC + (E)AC3/DTS/TrueHD + PCM + MPEG-4/H.263/MJPEG/MPEG-2)`);
   }
   const ctx = await SW.createHEVCSession(codecpar);
-  console.log("[sw-dec] libde265 : décodage logiciel HEVC activé (WASM)");
+  console.log("[sw-dec] libde265: HEVC software decoding enabled (WASM)");
   return [null, ctx, {}, {}];
 }
 export async function ff_decode_multi(ctx, _packet, _frame, packets) {

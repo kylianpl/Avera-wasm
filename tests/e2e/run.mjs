@@ -413,8 +413,8 @@ async function scenarioHdr(browser, name) {
     };
     return { left: avg(2, 26), right: avg(38, 62) };
   });
-  check("tone mapping actif (log [hdr])", logs.some((l) => l.includes("[hdr] flux pq")),
-    logs.find((l) => l.includes("[hdr] flux pq")) ?? "absent");
+  check("tone mapping actif (log [hdr])", logs.some((l) => l.includes("[hdr] stream pq")),
+    logs.find((l) => l.includes("[hdr] stream pq")) ?? "absent");
   // 100 nits PQ → ~204 (sRGB), 1000 nits → ~253 ; sans mapping : 130/192.
   check("100 nits mappés (~180-230)", px.left > 180 && px.left < 235, `gauche=${px.left.toFixed(0)}`);
   check("1000 nits mappés (~235-255)", px.right > 235, `droite=${px.right.toFixed(0)}`);
